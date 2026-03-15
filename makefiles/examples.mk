@@ -12,8 +12,8 @@ NVLDFLAGS += -L$(NCCL_HOME)/lib
 endif
 
 # Build configuration
-INCLUDES = -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include
-LIBRARIES = -L$(CUDA_HOME)/lib64 -L$(NCCL_HOME)/lib
+INCLUDES = -I$(NCCL_HOME)/include -I$(CUDA_HOME)/include
+LIBRARIES = -L$(NCCL_HOME)/lib -L$(CUDA_HOME)/lib64
 LDFLAGS = -lcudart -lnccl -Wl,-rpath,$(NCCL_HOME)/lib
 
 
