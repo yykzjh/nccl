@@ -9,6 +9,7 @@
 #include "nvtxDetail/nvtxExtPayloadHelperInternal.h"
 
 
+// 空的对象式宏，直接删除宏名
 /* This is just an empty marker (for readability), which can be omitted. */
 /* TODO: Fix issue with trailing comma at end of entry list. */
 #define NCCL_NVTX_PAYLOAD_ENTRIES

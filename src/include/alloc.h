@@ -40,6 +40,7 @@ constexpr size_t ncclSizeOfT<void>() {
   return 1;
 }
 
+// 标准库的 std::unique_ptr<T> 默认删除器调用 delete，由于 NCCL 用 malloc/calloc 分配内存，不能用 delete 释放，所以 NCCL 自定义了删除器，调用 std::free
 // C++14-compatible wrapper that captures function pointers through template parameters.
 template <typename FunctionPtr, FunctionPtr Function>
 struct ncclDeleterWrapper {
@@ -147,10 +148,13 @@ static inline ncclResult_t ncclCuMemHostFree(void* ptr) {
 template <typename T>
 ncclResult_t ncclCudaHostCallocDebug(T** ptr, size_t nelem, const char* file, int line, const char* callerFunc) {
   ncclResult_t result = ncclSuccess;
+  // cudaStreamCaptureModeRelaxed 表示放宽限制，允许在 capture 期间执行不可录制的操作
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
+  // 把当前线程的 capture 模式临时换成 Relaxed
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (nelem > 0) {
+    // 分配 pinned + GPU 可映射的主机内存
     CUDACHECKGOTO(cudaHostAlloc(ptr, nelem * ncclSizeOfT<T>(), cudaHostAllocMapped), result, finish);
     memset(*ptr, 0, nelem * ncclSizeOfT<T>());
   }
@@ -470,28 +474,52 @@ static inline ncclResult_t ncclCuMemGetAddressRange(CUdeviceptr userBuff, size_t
 
 #endif
 
+/*
+  T** ptr + size_t nelem：模板化的"分配 nelem 个 T"，实际字节数 = nelem * ncclSizeOfT<T>()。
+ncclSizeOfT<T>() 就是 sizeof(T)，但对 void 特化为 1（让"分配 N 字节裸内存"也能用同一套接口）。
+  file/line/callerFunc：调试元数据，仅用于日志定位。调用方不手写它们，而是通过宏自动注入。
+  struct ncclMemManager* manager：内存管理器，负责这块显存的记账与 suspend/resume（只在 VMM 路径真正用到）。
+  ncclMemType_t memType = ncclMemPersist：内存"驻留策略"，默认 Persist。
+*/
 template <typename T>
 ncclResult_t ncclCudaMallocDebug(T** ptr, size_t nelem, const char* file, int line, const char* callerFunc,
                                  struct ncclMemManager* manager, ncclMemType_t memType = ncclMemPersist) {
   ncclResult_t result = ncclSuccess;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   *ptr = nullptr;
+  /*
+  交换语义，把传入的 mode（此刻是 Relaxed）设为本线程新的捕获模式，同时把线程原来的模式写回 mode。
+  调用后：线程处于 Relaxed，变量 mode 保存着"原模式"，供 finish 处还原。这是"两阶段交换"的第一步。
+
+  为什么要 Relaxed：cudaMalloc / cuMem 这类分配是不可被捕获进 CUDA graph 的"不安全 API"。
+  如果调用线程恰好处在 cudaStreamBeginCapture 的捕获状态中，
+  在默认的 Global/ThreadLocal 模式下调用它会直接报 cudaErrorStreamCaptureUnsupported。
+  而 NCCL 的内部分配（abort flag、通信结构、缓冲区）常常发生在用户正把 NCCL 集合通信录进 graph 的时候，
+  这些分配是一次性 setup，本就不该被录进可重放的图里，也绝不能失败。切到 Relaxed 关闭本线程的捕获安全检查，让分配照常执行但不被捕获。
+  */
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (nelem > 0) {
     if (ncclCuMemEnable()) {
+      /*
+      走 VMM 路径 ncclCuMemAlloc：用 cuMem 驱动 API（cuMemCreate/cuMemAddressReserve/cuMemMap）分配，
+      ncclCuMemHandleType（默认 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR）指定可跨进程共享的句柄类型，并把 manager+memType 传进去做记账
+      */
       NCCLCHECKGOTO(ncclCuMemAlloc((void**)ptr, NULL, ncclCuMemHandleType, nelem * ncclSizeOfT<T>(), manager, memType),
                     result, finish);
     } else {
+      // 走传统 cudaMalloc：一把梭的普通设备分配，没有可共享句柄、不进 memManager 记账
       CUDACHECKGOTO(cudaMalloc(ptr, nelem * ncclSizeOfT<T>()), result, finish);
     }
   }
 finish:
+  // 线程恢复到进入前的捕获模式
   CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   if (*ptr == nullptr && nelem > 0) WARN("Failed to CUDA malloc %ld bytes", nelem * ncclSizeOfT<T>());
   INFO_LOC_FN(NCCL_ALLOC, file, line, callerFunc, "Cuda Alloc Size %ld pointer %p memType %d", nelem * ncclSizeOfT<T>(),
               *ptr, memType);
   return result;
 }
+
 #define ncclCudaMalloc(ptr, nelem, manager, ...) \
   ncclCudaMallocDebug(ptr, nelem, __FILE__, __LINE__, __func__, manager, ##__VA_ARGS__)
 

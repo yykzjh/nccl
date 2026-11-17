@@ -44,10 +44,10 @@ uint64_t hashCombine(uint64_t baseHash, uint64_t value);
 ncclResult_t getRandomData(void* buffer, size_t bytes);
 
 struct netIf {
-  char prefix[64];
-  int port;
-  int16_t rail;
-  int16_t plane;
+  char prefix[64];  // 前缀，如网卡名 “eth0” 或 IP "192.168.1.1"
+  int port;  // 端口
+  int16_t rail;  // 轨道号（多轨网络用）
+  int16_t plane;  // 平面号（多平面网络用）
 };
 
 int parseStringList(const char* string, struct netIf* ifList, int maxList);
@@ -84,9 +84,16 @@ inline ncclResult_t getRandomData(void* buffer, size_t bytes) {
       return ncclSystemError;
     }
     try {
+      // Linux 上通常后端是 /dev/urandom(或 RDRAND)，是非确定性真随机，不是 rand()/mt19937 那种可复现序列
       std::random_device rd;
       unsigned char* buf = static_cast<unsigned char*>(buffer);
+      // 逐字节填。调 rd() 8 次，每次取低 8 bit(略浪费，但简单可移植)。
       for (size_t i = 0; i < bytes; ++i) {
+        /*
+        rd() 返回类型是 std::random_device::result_type，标准规定是某种无符号整数类型。
+        在 libstdc++(gcc)上就是 unsigned int，即 32 位，取值范围 [0, 2³²-1](由 rd.min()=0、rd.max()=UINT_MAX 给出)。
+        这里只取低 8 位。
+        */
         buf[i] = static_cast<unsigned char>(rd());
       }
     } catch (const std::exception& e) {
@@ -232,15 +239,30 @@ T* ncclIntruQueueMpscAbandon(struct ncclIntruQueueMpsc<T, next>* me);
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// 一次规划周期内要批量分配大量小对象，生命周期整齐地整批结束，之后全部一次性“弹掉”，分配路径上不能有 malloc(锁、size 头、慢)，释放路径上不能逐个 free
 struct ncclMemoryStack {
+  // "大块"：一次 malloc 出来的大内存块(64KB 起步,几何增长)
+  /*
+  堆内存的真实来源。每个 hunk 就是 malloc(64KB + 前块大小) 的一整块，头部之后的空间用 bump 方式切给对象。
+  多个 hunk 通过 above 串成链，topFrame.hunk 指向最高的非空块——它上方的块(经 ->above 可达)都是弹栈后遗留的空块，留作复用。
+  */
   struct Hunk {
     struct Hunk* above; // reverse stack pointer
     size_t size; // size of this allocation (including this header struct)
   };
+  // "外块"：放不进 hunk 的大对象的"登记条"
+  /*
+  当请求的对象太大(放不进 hunk 也不值得新开 hunk),就单独 malloc 给它本体，同时在 hunk 内只放一个 16 字节的代理头挂到当前帧的 unhunks 链上。
+  这样 Pop 时能顺着链把每个外块对象逐个 free——hunk 内对象整块丢弃，外块对象单独回收。
+  */
   struct Unhunk { // proxy header for objects allocated out-of-hunk
     struct Unhunk* next;
     void* obj;
   };
+  // "快照"：某一作用域时刻的完整分配状态
+  /*
+  Frame 是 Push/Pop 的载体：进入新作用域前把当前状态拍快照，退出时恢复。快照本身也存在栈自己的 hunk 里
+  */
   struct Frame {
     struct Hunk* hunk; // top of non-empty hunks
     uintptr_t bumper, end; // points into top hunk
@@ -251,8 +273,8 @@ struct ncclMemoryStack {
   static void* allocateSpilled(struct ncclMemoryStack* me, size_t size, size_t align);
   static void* allocate(struct ncclMemoryStack* me, size_t size, size_t align);
 
-  struct Hunk stub;
-  struct Frame topFrame;
+  struct Hunk stub;  // 哨兵 hunk(永远空,让代码无需判空)
+  struct Frame topFrame;  // 当前活跃帧
 };
 
 inline void ncclMemoryStackConstruct(struct ncclMemoryStack* me) {
@@ -266,12 +288,19 @@ inline void ncclMemoryStackConstruct(struct ncclMemoryStack* me) {
 }
 
 inline void* ncclMemoryStack::allocate(struct ncclMemoryStack* me, size_t size, size_t align) {
+  /*
+  把 bumper(当前分配水位)向上取整到 align 的倍数，得到候选对象地址 o，这个技巧只对 2 的幂对齐值成立(传入的都是 alignof(T),天然是 2 的幂)。
+    align = 8 → 二进制 1000,align - 1 = 0111 是低位掩码，~(align-1) = ...11111000 把低 3 位清零；
+    先 +7(111) 保证向上进位，再 & ~7 舍掉零头。
+  */
   uintptr_t o = (me->topFrame.bumper + align - 1) & ~(uintptr_t(align) - 1);
   void* obj;
   if (COMPILER_EXPECT(o + size <= me->topFrame.end, true)) {
+    // 分配 o ~ o+size 这块内存区域
     me->topFrame.bumper = o + size;
     obj = reinterpret_cast<void*>(o);
   } else {
+    // 溢出路径。当前 hunk 塞不下，交给 spilled 处理(复用空块 / 新开 hunk / Unhunk 外块
     obj = allocateSpilled(me, size, align);
   }
   return obj;
@@ -321,7 +350,20 @@ inline void ncclMemoryStackPop(struct ncclMemoryStack* me) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+/*
+为什么需要"池"这一层？栈（ncclMemoryStack）的特性是只能整体弹出，不能单独释放某个对象。而 NCCL 有一类对象的模式是：
+  数量巨大：每次集合通信、每个 channel 都要一个 ncclProxyOp；每个 group 一个 ncclKernelPlan。
+  生命周期短且交错：plan 执行完就该回收，但下一个 plan 可能还在跑，无法用"整层弹出"的方式管。
+  大小固定：同一种 task 结构体尺寸完全一样。
+对这类对象，malloc/free 太慢（NCCL 的 enqueue 路径是延迟敏感的热路径），栈又不支持单个回收。
+free list 池正是这个场景的标准答案：同尺寸对象反复分配释放，回收的内存原地挂回链表，下次直接摘走用。
+*/
+
 struct ncclMemoryPool {
+  /*
+  当一个对象被 free 回池里时，它已经"死了"，内容不再有意义，于是把它的头 8 字节拿来存 next 指针，
+  把所有空闲对象串成一条链。这样 free list 不需要任何额外的元数据内存。
+  */
   struct Cell {
     Cell* next;
   };
@@ -329,6 +371,7 @@ struct ncclMemoryPool {
   struct Cell* tail; // meaningful only when head != nullptr
 };
 
+// 构造一个池等价于把它清零
 inline void ncclMemoryPoolConstruct(struct ncclMemoryPool* me) {
   me->head = nullptr;
 }
@@ -337,13 +380,27 @@ template <typename T>
 inline T* ncclMemoryPoolAlloc(struct ncclMemoryPool* me, struct ncclMemoryStack* backing) {
   using Cell = ncclMemoryPool::Cell;
   Cell* cell;
-  if (COMPILER_EXPECT(me->head != nullptr, true)) {
+  if (COMPILER_EXPECT(me->head != nullptr, true)) {  // 大概率链表不为空
+    /*
+    摘出链表头
+    格子大小是第一次分配时按当时的 T 定下的，若后续用不同尺寸的 T 混用同一个池，复用旧格子时就可能装不下。
+    这个约束纯靠调用方自律，没有任何编译期或运行期检查。所以 NCCL 才为每种对象开一个独立命名的池
+    （memPool_ncclTaskColl、memPool_ncclProxyOp…），用命名约定代替类型系统来保证安全
+    */
     cell = me->head;
     me->head = cell->next;
   } else {
-    // Use the internal allocate() since it doesn't memset to 0 yet.
+    /*
+    Free 时要把对象当 Cell 用、往它头上写 next 指针（8 字节）。
+    如果 T 本身小于 8 字节，写 next 就会越界破坏相邻内存。取 max 保证每个格子至少能装下一个指针。
+    */
     size_t cellSize = std::max(sizeof(Cell), sizeof(T));
+    // cellAlign 取最大值保证两种用法的对齐要求都满足
     size_t cellAlign = std::max(alignof(Cell), alignof(T));
+    /*
+    外层的 ncclMemoryStackAlloc 会自动 memset(obj, 0, size)，而这里末尾统一有一次 memset(cell, 0, sizeof(T))，
+    用外层版本会清零两遍。这是避免冗余工作的细节优化。
+    */
     cell = (Cell*)ncclMemoryStack::allocate(backing, cellSize, cellAlign);
   }
   memset(cell, 0, sizeof(T));
@@ -352,10 +409,15 @@ inline T* ncclMemoryPoolAlloc(struct ncclMemoryPool* me, struct ncclMemoryStack*
 
 template <typename T>
 inline void ncclMemoryPoolFree(struct ncclMemoryPool* me, T* obj) {
+  /*
+  内存完全不归还给栈，更不归还给 OS——只是挂回 free list。这意味着：
+    池占用的内存量 = 历史峰值并发对象数 × 对象大小，之后稳定不变，永不下降。
+    直到 comm 销毁、memPermanent 整体 ncclMemoryStackDestruct 时才真正还给 OS。
+  */
   using Cell = ncclMemoryPool::Cell;
-  Cell* cell = reinterpret_cast<Cell*>(obj);
+  Cell* cell = reinterpret_cast<Cell*>(obj);  // 把对象重新解释成链表节点
   cell->next = me->head;
-  if (me->head == nullptr) me->tail = cell;
+  if (me->head == nullptr) me->tail = cell;  // 第一个入链者成为 tail
   me->head = cell;
 }
 
@@ -370,6 +432,12 @@ inline void ncclMemoryPoolTakeAll(struct ncclMemoryPool* me, struct ncclMemoryPo
 
 ////////////////////////////////////////////////////////////////////////////////
 
+/*
+侵入式队列(intrusive queue) 的容器头
+  typename T 是类型参数，表示队列元素的结构体类型
+  T* T::* next 是非类型参数，表示一个“指向 T 中某个成员”的指针，该成员类型必须是 T*。
+T::* 表示指向 T 中某个成员的指针，T* 表示该成员类型必须是 T* 
+*/
 template <typename T, T* T::* next>
 struct ncclIntruQueue {
   T *head, *tail;
@@ -401,6 +469,7 @@ inline T* ncclIntruQueueTail(ncclIntruQueue<T, next>* me) {
 template <typename T, T* T::* next>
 inline void ncclIntruQueueEnqueue(ncclIntruQueue<T, next>* me, T* x) {
   x->*next = nullptr;
+  // ->*next 表示取模板中指定的 next 这个成员指针的值，可能成员名并不是 next，由模板参数指定
   (me->head ? me->tail->*next : me->head) = x;
   me->tail = x;
   me->nElems += 1;
@@ -501,10 +570,26 @@ void ncclIntruQueueTransfer(ncclIntruQueue<T, next>* dst, ncclIntruQueue<T, next
 
 ////////////////////////////////////////////////////////////////////////////////
 
+/*
+普通版 ncclIntruQueue，Enqueue/Dequeue 都是普通指针操作，没有任何原子操作或锁。这意味着它只能在单线程内（或调用方自己保证不并发）使用。
+
+ncclIntruQueueMpsc，多生产者、单消费者、无锁。无锁（lock-free）队列，专为"多个线程同时往里塞、只有一个线程往外取"的场景设计。几个精妙点：
+  1. tail 是 uintptr_t 而非指针，因为它同时兼任"状态标志"。它有三个魔术值：
+    0x0：队列空
+    0x1：队列空，且消费者正在睡眠等待（需要被唤醒）
+    0x2：队列已被 abandon（弃用）
+    其他值：指向真正的尾节点（把指针 reinterpret 成整数存）
+    ncclIntruQueueMpscEmpty 判空就是 tail <= 0x2。
+  2. 入队用原子交换（COMPILER_ATOMIC_EXCHANGE）。多个生产者线程同时入队时，靠这一条原子交换把新元素"抢"到 tail 位置，
+  返回旧 tail。谁抢到旧 tail，谁负责把旧尾节点的 next 指向自己。这是无锁 MPSC 队列的经典手法，全程不加锁。
+  3. 消费者休眠/唤醒机制（waiting 字段）：消费者取空时不会一直空转烧 CPU，先自旋 10 微秒（spin for first 10us），
+  还没数据就把 tail 用 CAS 从 0x0 改成 0x1（标记"我要睡了"）然后 cond.wait 睡下。生产者入队时若发现旧 tail 是 0x1，
+  就知道消费者在睡，负责 notify_all 把它叫醒。这就是 waiting/ncclThreadSignal 那套东西的用途。
+*/
 template <typename T, T* T::* next>
 struct ncclIntruQueueMpsc {
   T* head;
-  uintptr_t tail;
+  uintptr_t tail;  // 注意是整数，不是指针
   struct ncclThreadSignal* waiting;
 };
 

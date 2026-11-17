@@ -69,6 +69,7 @@ static ncclResult_t ncclGinPluginUnload(ginPluginLib_t* pluginLib) {
 }
 
 static ncclResult_t ncclGinPluginLoad(ginPluginLib_t* pluginLib) {
+  // 打开 GIN 插件 .so 动态库句柄
   // Entries borrowed from RMA/NET may already have a handle;
   // after unload, reopen the same library by its saved name/path.
   if (pluginLib->dlHandle == NULL) {
@@ -76,6 +77,7 @@ static ncclResult_t ncclGinPluginLoad(ginPluginLib_t* pluginLib) {
     if (pluginLib->dlHandle == nullptr) goto fail;
   }
 
+  // 按照 ABI 版本从新到旧调用 getNcclGin_v** 获取 getNcclGin_t 符号对象
   // load gin
   for (int i = 0; i < NCCL_GIN_VERSION_COUNT; i++) {
     pluginLib->version = ncclGinVersion[i];
@@ -104,6 +106,7 @@ fail:
 static ncclResult_t ncclGinPluginInit(struct ncclComm* comm, ginPluginLib_t* pluginLib, void** outContext) {
   int ndev;
   bool ginInitCompleted = false;
+  // 调用 GIN 插件内部的初始化获取 comm->ginContext 上下文
   // Init must be called for each new comm to set the right context
   *outContext = NULL;
   if (pluginLib->state >= ncclGinPluginStateInitReady && pluginLib->ncclGin) {
@@ -137,11 +140,14 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
   if (pluginLibs[pluginIndex].state >= ncclGinPluginStateEnabled) {
     ncclGin_t* gin = pluginLibs[pluginIndex].ncclGin;
     ncclNetProperties_t props;
+    // 获取第一个设备属性
     NCCLCHECK(gin->getProperties(0, &props));
 
+    // 获取指定的 GIN 卸载类型
     int64_t ginType = ncclParamGinType();
     bool isExternal = pluginIndex < (pluginCount - NCCL_GIN_NUM_INTERNAL_PLUGINS);
 
+    // 设备支持的卸载类型与指定的 GIN 卸载类型不同
     if (ginType != -1 && props.netDeviceType != ginType) {
       INFO(NCCL_INIT | NCCL_NET, "GIN/Plugin: Skipping plugin %s index %d type %d: NCCL_GIN_TYPE=%ld requested",
            gin->name, pluginIndex, props.netDeviceType, ginType);
@@ -162,6 +168,12 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
       }
     }
 
+    /*
+    外部插件里，真硬件卸载的欢迎(不满足条件二，正常往下走绑定)；只是 proxy 的谢绝(命中本分支)，这个活儿交给我自带的 proxy-over-RMA。
+    GIN 插件表尾部固定有两个内置插件(NCCL_GIN_NUM_INTERNAL_PLUGINS == 2)，由 initPluginLibsOnceFunc 注册：
+      1. ncclGinIbGdaki —— 真正的 IB 硬件 GPU-initiated 卸载(GDAKI)；
+      2. ncclGinProxy —— 内置的 GIN proxy 兜底，跑在 RMA 后端之上。
+    */
     if (isExternal && props.netDeviceType == NCCL_NET_DEVICE_GIN_PROXY) {
       INFO(NCCL_INIT | NCCL_NET,
            "GIN/Plugin: Skipping external proxy plugin %s index %d; using NCCL GIN proxy over RMA backend %s",
@@ -172,6 +184,15 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
 
     // NOTE: The following cast is valid because ncclGinType_t variant values
     // should match NCCL_NET_DEVICE_GIN_* values from `enum ncclNetDeviceType`.
+    /*
+    把一个枚举裸转成另一个枚举，之所以合法，是因为两张枚举表被刻意设计成同值对齐：
+    值  ncclNetDeviceType(net 侧)	    ncclGinType_t(GIN 侧)
+    0   NCCL_NET_DEVICE_HOST(不卸载)	 NCCL_GIN_TYPE_NONE
+    1	  NCCL_NET_DEVICE_UNPACK	      (故意空缺，注释 "intentionally not 1")
+    2	  NCCL_NET_DEVICE_GIN_PROXY	    NCCL_GIN_TYPE_PROXY
+    3	  NCCL_NET_DEVICE_GIN_GDAKI	    NCCL_GIN_TYPE_GDAKI
+    4	  NCCL_NET_DEVICE_GIN_GPI	      NCCL_GIN_TYPE_GPI
+    */
     ncclGinType_t backendType = static_cast<ncclGinType_t>(props.netDeviceType);
     struct ncclGinState* ginState = &comm->ginState;
     if (ginState->numActiveBackends >= NCCL_GIN_MAX_ACTIVE_BACKENDS) {
@@ -179,6 +200,7 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
       return ncclSuccess;
     }
 
+    // 每个活动 GIN 后端保存自己的插件实例、索引和能力，避免沿用旧版单后端状态布局。
     struct ncclGinBackendState* backend = &ginState->backends[ginState->numActiveBackends++];
     backend->ginType = backendType;
     backend->ncclGin = gin;
@@ -186,10 +208,13 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
     backend->pluginIndex = pluginIndex;
     ginState->supported = true;
 
+    // 查询并缓存 GIN 能力标志
     ncclGinProperties_t ginProperties;
     memset(&ginProperties, 0, sizeof(ginProperties));
     NCCLCHECK(gin->getGinProperties(&ginProperties));
+    // 是否支持“强信号”语义
     backend->supportsStrongSignals = ginProperties.supportsStrongSignals;
+    // 是否支持基于虚拟地址(VA)的信号
     backend->supportsVASignals = ginProperties.supportsVASignals;
     backend->barrierOptions = ginProperties.barrierOptions;
   }
@@ -242,17 +267,20 @@ static void initPluginLibsOnceFunc() {
     strcpy(pluginLibs[pluginCounter++].name, defaultGinPlugin);
   }
 
+  // NET 插件加载了拉进 GIN 插件候选池，NET 的库被 GIN 借用当后端候选
   // Also check if the NET plugin has GIN support
   if ((pluginLibs[pluginCounter].dlHandle = ncclGetNetPluginLib(ncclPluginTypeGin)) != NULL) {
     pluginLibs[pluginCounter].state = ncclGinPluginStateLoadReady;
     strcpy(pluginLibs[pluginCounter++].name, ncclGetPluginLibName(ncclPluginTypeGin));
   }
 
+  // 添加内部 IB GDAKI 插件
   // Add internal ib plugin
   pluginLibs[pluginCounter].ncclGin = &ncclGinIbGdaki;
   pluginLibs[pluginCounter].state = ncclGinPluginStateInitReady;
   pluginLibs[pluginCounter].version = ncclGinVersion[0];
   pluginCounter++;
+  // 添加 ncclGinProxy 插件
   // Add gin proxy as fallback
   pluginLibs[pluginCounter].ncclGin = &ncclGinProxy;
   pluginLibs[pluginCounter].state = ncclGinPluginStateInitReady;
@@ -273,6 +301,7 @@ static ncclResult_t ncclGinPluginFinalize(struct ncclComm* comm, int pluginIndex
 }
 
 ncclResult_t ncclGinInit(struct ncclComm* comm) {
+  // GIN 仅支持 CUDA CC 版本大于等于 7.0
   if (comm->compCap < 70) {
     /* GIN only supported for Volta and later */
     INFO(NCCL_INIT, "Compute Capability (%d) is not sufficient to enable GIN.  Require Volta (70) or newer.",
@@ -281,19 +310,24 @@ ncclResult_t ncclGinInit(struct ncclComm* comm) {
   }
 
   bool initialized = false;
+  // 解析 GIN 插件名并初始化状态
   std::call_once(initPluginLibsOnceFlag, initPluginLibsOnceFunc);
+  // 加锁遍历所有 GIN 插件
   std::lock_guard<std::mutex> lock(pluginMutex);
   for (int pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++) {
     if (pluginIndex < (pluginCount - NCCL_GIN_NUM_INTERNAL_PLUGINS) &&
         pluginLibs[pluginIndex].state == ncclGinPluginStateLoadReady) {
+      // 打开 GIN 插件的 .so 动态库 handle，并获取 getNcclGin_t 符号对象
       NCCLCHECK(ncclGinPluginLoad(&pluginLibs[pluginIndex]));
     }
     if (pluginLibs[pluginIndex].state >= ncclGinPluginStateInitReady) {
+      // 初始化获取 GIN 上下文，保存到 comm
       // plugin init must be done by all comms to setup the context, therefore we use ">="
       void* ginContext = NULL;
       NCCLCHECK(ncclGinPluginInit(comm, &pluginLibs[pluginIndex], &ginContext));
       if (pluginLibs[pluginIndex].state == ncclGinPluginStateEnabled) {
         bool isAssigned = false;
+        // 校验卸载类型，将 GIN 相关属性信息保存到 comm->sharedRes->ginState
         NCCLCHECK(ncclGinPluginAssignToComm(comm, pluginIndex, ginContext, &isAssigned));
         if (!isAssigned) {
           NCCLCHECK(ncclGinPluginFinalize(comm, pluginIndex, ginContext));

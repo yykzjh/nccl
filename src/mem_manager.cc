@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <mutex>
 
+// 默认不禁用 memory manager
 // Internal parameter to disable memory manager for testing
 NCCL_PARAM(MemManagerDisable, "DISABLE_MEM_MANAGER", 0);
 
@@ -34,23 +35,26 @@ ncclResult_t ncclMemManagerInit(struct ncclComm* comm) {
   if (comm == nullptr) return ncclInvalidArgument;
 
   ncclMemManager* mgr;
-  NCCLCHECK(ncclCalloc(&mgr, 1));
+  NCCLCHECK(ncclCalloc(&mgr, 1));  // 裸内存，零初始化，不跑构造函数
+  // 显式 placement new 构造 std::mutex
   // Explicitly construct std::mutex using placement new
   new (&mgr->lock) std::mutex();
 
-  mgr->entries = nullptr;
+  mgr->entries = nullptr;  // 空链表
   mgr->numEntries = 0;
-  mgr->released = 0;
-  mgr->refCount = 1;
+  mgr->released = 0;  // 未挂起
+  mgr->refCount = 1;  // 创建者持首个引用
+  // 六个统计量清零
   mgr->totalPersist = 0;
   mgr->totalPersistImported = 0;
   mgr->totalScratch = 0;
   mgr->totalScratchImported = 0;
   mgr->totalOffload = 0;
   mgr->totalOffloadImported = 0;
-  mgr->cpuBackupUsage = 0;
-  mgr->commCudaDev = comm->cudaDev;
+  mgr->cpuBackupUsage = 0;  // 当前 host 备份占用
+  mgr->commCudaDev = comm->cudaDev;  // 记住服务于哪个 GPU
 
+  // release 语义发布 initialized(并发安全的关键)
   COMPILER_ATOMIC_STORE(&mgr->initialized, 1, std::memory_order_release);
 
   comm->memManager = mgr;

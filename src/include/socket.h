@@ -39,6 +39,7 @@
 #define SOCKET_NAME_MAXLEN (NI_MAXHOST + NI_MAXSERV)
 #define NCCL_SOCKET_MAGIC 0x564ab9f2fc4b9d6cULL
 
+// 实际使用时被强制类型转换为系统的 sockaddr 类型 (struct sockaddr_in*)
 /* Placeholder; real definition needs sockaddr from system headers */
 union ncclSocketAddress {
   char _storage[28];
@@ -60,16 +61,16 @@ struct ncclSocketCrypto;
 enum ncclSocketState {
   ncclSocketStateNone = 0,
   ncclSocketStateInitialized = 1,
-  ncclSocketStateAccepting = 2,
-  ncclSocketStateAccepted = 3,
-  ncclSocketStateConnecting = 4,
-  ncclSocketStateConnectPolling = 5,
-  ncclSocketStateConnected = 6,
-  ncclSocketStateReady = 7,
+  ncclSocketStateAccepting = 2,  // 服务端：等待 accept
+  ncclSocketStateAccepted = 3,  // 服务端：已 accept，待握手
+  ncclSocketStateConnecting = 4,  // 客户端：开始 connect
+  ncclSocketStateConnectPolling = 5,  // 客户端：connect 阻塞中，轮询
+  ncclSocketStateConnected = 6,  // 客户端：connect 完成，待握手
+  ncclSocketStateReady = 7,  // 双方：连接建立且握手完成
   ncclSocketStateTerminating = 8,
   ncclSocketStateClosed = 9,
   ncclSocketStateError = 10,
-  ncclSocketStateBadHandshake = 11,
+  ncclSocketStateBadHandshake = 11,  // 握手失败（通常是 magic 不匹配）
   ncclSocketStateNum = 12
 };
 
@@ -89,19 +90,36 @@ enum ncclSocketType {
 
 // Contains owned OS and TLS state. Do not copy with raw struct assignment or
 // memcpy; use ncclSocketMove when transferring socket ownership.
+/*
+NCCL 统一的 TCP socket 抽象——把 IPv4/IPv6、同步/异步、连接握手、可中止、可重试全部封装进一个结构
+*/
 struct ncclSocket {
+  // 数据收发 fd(accept 后 = 新连接 fd)
   ncclSocketDescriptor socketDescriptor;
+  // 监听 fd(accept 的来源)
   ncclSocketDescriptor acceptSocketDescriptor;
+  // 瞬时错误重试计数
   int errorRetries;
+  // 	IPv4/IPv6 统一地址。connect 时是对端地址,listen 时是本地绑定地址,accept 时被内核填入对端地址
   union ncclSocketAddress addr;
   volatile uint32_t* abortFlag;
+  // 同步阻塞 or 异步增量
   int asyncFlag;
   enum ncclSocketState state;
+  /*
+  sockaddr 长度(随地址族变)。IPv4 是 sizeof(sockaddr_in)、IPv6 是 sizeof(sockaddr_in6)，
+  传给 bind/connect/accept/getsockname 这些需要地址长度的系统调用。
+  */
   int salen;
+  // 连接状态机
   uint64_t magic;
+  // socket 用途类别(bootstrap/proxy/…)
   enum ncclSocketType type;
+  // 是否关闭内置重试、交调用方自管
   int customRetry;
+  // 异步握手已传输字节数
   int finalizeCounter; // Used to keep track of initial handshake for async sockets.
+  // 异步收 magic 的中转缓冲
   char finalizeBuffer[NCCL_SOCKET_PLAIN_HELLO_BYTES]; // Used to keep track of initial handshake for async sockets.
   struct ncclSocketCrypto* crypto;
 #ifdef NCCL_OS_WINDOWS

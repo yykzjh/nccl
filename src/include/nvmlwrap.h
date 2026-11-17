@@ -33,8 +33,8 @@ typedef struct nvmlDevice_st* nvmlDevice_t;
 #define NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE 80
 
 typedef enum nvmlEnableState_enum {
-  NVML_FEATURE_DISABLED = 0,     //!< Feature disabled
-  NVML_FEATURE_ENABLED = 1      //!< Feature enabled
+  NVML_FEATURE_DISABLED = 0,  // 链路/特性未启用
+  NVML_FEATURE_ENABLED = 1  // 链路/特性已启用
 } nvmlEnableState_t;
 
 typedef enum nvmlNvLinkCapability_enum {
@@ -73,11 +73,18 @@ typedef enum nvmlReturn_enum {
 } nvmlReturn_t;
 
 typedef struct nvmlPciInfo_st {
+  // "domain:bus:device.function"，16 字节
   char busIdLegacy
     [NVML_DEVICE_PCI_BUS_ID_BUFFER_V2_SIZE]; //!< The legacy tuple domain:bus:device.function PCI identifier (&amp; NULL terminator)
   unsigned int domain; //!< The PCI domain on which the device's bus resides, 0 to 0xffffffff
   unsigned int bus; //!< The bus on which the device resides, 0 to 0xff
   unsigned int device; //!< The device's id on the bus, 0 to 31
+  /*
+  nvmlPciInfo_t 结构体里关键字段是两个 32 位整数，它们把 PCI 配置空间的多组 16 位寄存器打包在一起：
+  字段	                    低 16 位	                        高 16 位
+  pciInfo.pciDeviceId	     Vendor ID（厂商）	                Device ID（设备）
+  pciInfo.pciSubSystemId	 Subsystem Vendor ID（子系统厂商）	 Subsystem Device ID（子系统设备）
+  */
   unsigned int pciDeviceId; //!< The combined 16-bit device id and 16-bit vendor id
 
   // Added in NVML 2.285 API
@@ -114,23 +121,25 @@ typedef enum nvmlIntNvLinkDeviceType_enum {
 } nvmlIntNvLinkDeviceType_t;
 
 /* P2P Capability Index Status*/
+// NVML 对“两块 GPU 之间能否直接 P2P 互访显存”这个问题返回的状态码——OK 表示能，其余每个值都是“不能”的具体原因
 typedef enum nvmlGpuP2PStatus_enum {
-  NVML_P2P_STATUS_OK = 0,
-  NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED,
-  NVML_P2P_STATUS_GPU_NOT_SUPPORTED,
-  NVML_P2P_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED,
-  NVML_P2P_STATUS_DISABLED_BY_REGKEY,
-  NVML_P2P_STATUS_NOT_SUPPORTED,
-  NVML_P2P_STATUS_UNKNOWN
+  NVML_P2P_STATUS_OK = 0,  // P2P 可用——两块 GPU 能直接互访显存(唯一的“通过”值)
+  NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED,  // 芯片组不支持(主板/PCIe 芯片组不允许 P2P)。注意 SUPPORED 是拼写错误
+  NVML_P2P_STATUS_GPU_NOT_SUPPORTED,  // GPU 型号本身不支持 P2P
+  NVML_P2P_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED,  // IOH(I/O Hub)拓扑不支持：两 GPU 挂在不同的 I/O Hub 下、或跨 QPI/UPI 总线，P2P 路径不通
+  NVML_P2P_STATUS_DISABLED_BY_REGKEY,  // 被注册表键禁用(Windows 平台特定的配置项关掉了 P2P)
+  NVML_P2P_STATUS_NOT_SUPPORTED,  // 泛化的“不支持”
+  NVML_P2P_STATUS_UNKNOWN  // 状态未知
 } nvmlGpuP2PStatus_t;
 
+// p2pIndex 是配套的能力索引枚举 nvmlGpuP2PCapsIndex_t,指定“查哪一种 P2P 能力”
 /* P2P Capability Index*/
 typedef enum nvmlGpuP2PCapsIndex_enum {
-  NVML_P2P_CAPS_INDEX_READ = 0,
-  NVML_P2P_CAPS_INDEX_WRITE,
-  NVML_P2P_CAPS_INDEX_NVLINK,
-  NVML_P2P_CAPS_INDEX_ATOMICS,
-  NVML_P2P_CAPS_INDEX_PROP,
+  NVML_P2P_CAPS_INDEX_READ = 0,  // GPU A 能否读 GPU B 的显存
+  NVML_P2P_CAPS_INDEX_WRITE,  // GPU A 能否写 GPU B 的显存
+  NVML_P2P_CAPS_INDEX_NVLINK,  // 该 P2P 路径是否走 NVLink
+  NVML_P2P_CAPS_INDEX_ATOMICS,  // 是否支持跨 GPU P2P 原子操作
+  NVML_P2P_CAPS_INDEX_PROP,  // 其它属性
   NVML_P2P_CAPS_INDEX_UNKNOWN
 } nvmlGpuP2PCapsIndex_t;
 
@@ -148,6 +157,7 @@ typedef enum nvmlValueType_enum {
   NVML_VALUE_TYPE_COUNT
 } nvmlValueType_t;
 
+// 同一块内存按不同字段类型解读
 /**
  * Union to represent different types of Value
  */
@@ -191,29 +201,40 @@ typedef union nvmlValue_st {
 
 #define NVML_FI_MAX 173 //!< One greater than the largest field ID defined above
 
+/*
+NVML 的通用"字段查询"载体，这是一个"一次调用可批量查多个字段"的设计：调用方填好 fieldId + scopeId（输入），
+NVML 回填 nvmlReturn + value（输出），关键不变量是 value 只有在 nvmlReturn == NVML_SUCCESS 时才有意义。
+*/
 /**
  * Information for a Field Value Sample
  */
 typedef struct nvmlFieldValue_st {
+  // 要查哪个字段，如 NVML_FI_DEV_NVLINK_GET_STATE(=165)
   unsigned int fieldId; //!< ID of the NVML field to retrieve. This must be set before any call that uses
   //!< this struct. See the constants starting with NVML_FI_ above.
+  // 字段的"作用域"，对 NVLink 而言就是链路号 l
   unsigned int scopeId; //!< Scope ID can represent data used by NVML depending on fieldId's context. For
   //!< example, for NVLink throughput counter data, scopeId can represent linkId.
+  // 采样时间戳
   long long timestamp; //!< CPU Timestamp of this value in microseconds since 1970
+  // 取值耗时
   long long latencyUsec; //!< How long this field value took to update (in usec) within NVML. This may be
   //!< averaged across several fields that are serviced by the same driver call.
+  // value 的类型标记
   nvmlValueType_t valueType; //!< Type of the value stored in value
+  // 本字段的返回码，读 value 前必须先检查它
   nvmlReturn_t nvmlReturn; //!< Return code for retrieving this value. This must be checked before looking at
   //!< value, as value is undefined if nvmlReturn != NVML_SUCCESS
+  // 实际值，仅当 nvmlReturn==NVML_SUCCESS 时有效
   nvmlValue_t value; //!< Value for this field. This is only valid if nvmlReturn == NVML_SUCCESS
 } nvmlFieldValue_t;
 
 #define NVML_GPU_FABRIC_UUID_LEN 16
 
-#define NVML_GPU_FABRIC_STATE_NOT_SUPPORTED 0
-#define NVML_GPU_FABRIC_STATE_NOT_STARTED 1
-#define NVML_GPU_FABRIC_STATE_IN_PROGRESS 2
-#define NVML_GPU_FABRIC_STATE_COMPLETED 3
+#define NVML_GPU_FABRIC_STATE_NOT_SUPPORTED 0  // 硬件根本不支持 fabric
+#define NVML_GPU_FABRIC_STATE_NOT_STARTED 1  // 支持但注册未开始
+#define NVML_GPU_FABRIC_STATE_IN_PROGRESS 2  // 注册进行中
+#define NVML_GPU_FABRIC_STATE_COMPLETED 3  // 注册完成(唯一可用态)
 
 typedef unsigned char nvmlGpuFabricState_t;
 
@@ -257,13 +278,19 @@ typedef struct {
  * \ref nvmlGpuFabricInfo_t.
  */
 typedef struct {
+  // 结构版本号(调用方先填 nvmlGpuFabricInfo_v2)
   unsigned int version; //!< Structure version identifier (set to
   //!< \ref nvmlGpuFabricInfo_v2)
+  // 该 GPU 所属 cluster(NVL 域)的 UUID，NVML_GPU_FABRIC_UUID_LEN=16
   unsigned char clusterUuid[NVML_GPU_FABRIC_UUID_LEN]; //!< Uuid of the cluster to which this GPU belongs
+  // 错误状态，仅当 state=COMPLETED 才需看
   nvmlReturn_t status; //!< Error status, if any. Must be checked only if
   //!< state returns "complete".
+  // 该 GPU 所属 fabric clique 的 ID
   unsigned int cliqueId; //!< ID of the fabric clique to which this GPU belongs
+  // GPU fabric 注册状态(unsigned char)
   nvmlGpuFabricState_t state; //!< Current state of GPU registration process
+  // fabric 健康掩码(如降级带宽)
   unsigned int healthMask; //!< GPU Fabric health Status Mask
 } nvmlGpuFabricInfo_v2_t;
 
@@ -274,21 +301,42 @@ typedef nvmlGpuFabricInfo_v2_t nvmlGpuFabricInfoV_t;
  */
 #define nvmlGpuFabricInfo_v2 NVML_STRUCT_VERSION(GpuFabricInfo, 2)
 
+/*
+chassisSerialNumber  (机架/机箱 —— 最大单位)
+   └── slotNumber     (机架内的插槽，含交换机槽)
+         └── trayIndex  (计算托盘索引，不含交换机)
+               └── hostId    (托盘/slot 内的节点序号)
+                     └── moduleId   (节点内的第几块 GPU —— 最小单位)
+  slotNumber vs trayIndex 的区别（最容易混）：slotNumber 是物理插槽号，把 NVLink 交换机占的槽也算进去。
+trayIndex 只在计算插槽范围内编号，排除交换机。所以同一个托盘，slotNumber 可能因为它前面插了交换机而偏大，trayIndex 则是纯计算序号。
+两者一个"含交换机"一个"不含"，注释特意点出这个差异。
+  hostId vs moduleId：hostId 定位到节点/主机（一个 slot 里可能有多个计算节点），moduleId 再定位到该节点内的具体 GPU。
+  ibGuid 走的是另一条线——它不是位置坐标，而是网络身份：平台给这块 GPU 关联的 IB 网卡 GUID，用于把 NVLink 域和 IB 网络拓扑对应起来。
+  peerType 描述 NVLink 邻居性质（有没有经过交换机），影响 NCCL 对 NVLink 连接形态的判断。
+*/
 /**
  * Structure to store platform information (v2)
  */
 typedef struct {
+  // 结构版本号，调用前须置 nvmlPlatformInfo_v2
   unsigned int version; //!< the API version number
+  // 平台上报的 InfiniBand GUID（关联网卡的全球唯一标识）
   unsigned char ibGuid[16]; //!< Infiniband GUID reported by platform (for Blackwell, ibGuid is 8
   //!< bytes so indices 8-15 are zero)
+  // 机箱/机架序列号，本 GPU 所在 chassis 的唯一编号
   unsigned char chassisSerialNumber[16]; //!< Serial number of the chassis containing this GPU (for Blackwell
   //!< it is 13 bytes so indices 13-15 are zero)
+  // 本 GPU 在 chassis 内的插槽号（含 switches 槽位）
   unsigned char slotNumber; //!< The slot number in the chassis containing this GPU (includes
   //!< switches)
+  // 在计算插槽范围内的托盘索引（不含 switches）
   unsigned char trayIndex; //!< The tray index within the compute slots in the chassis containing
   //!< this GPU (does not include switches)
+  // 该 slot 内节点的索引（一个 slot 可能含多个 host/节点）
   unsigned char hostId; //!< Index of the node within the slot containing this GPU
+  // 平台标示的 NVLink 邻居类型（例如是否存在 NVLink switch）
   unsigned char peerType; //!< Platform indicated NVLink-peer type (e.g. switch present or not)
+  // 本 GPU 在节点内的 ID（节点内第几块 GPU）
   unsigned char moduleId; //!< ID of this GPU within the node
 } nvmlPlatformInfo_v2_t;
 
@@ -347,11 +395,13 @@ typedef enum nvmlMemoryLocation_enum {
 #endif // NCCL_NVML_DIRECT
 
 constexpr int ncclNvmlMaxDevices = 32;
+// NVML 设备包含：句柄、计算能力版本
 struct ncclNvmlDeviceInfo {
   nvmlDevice_t handle;
   int computeCapabilityMajor, computeCapabilityMinor;
   bool cudaVisible;
 };
+// 主要查询 P2P 的读和写能力
 struct ncclNvmlDevicePairInfo {
   nvmlGpuP2PStatus_t p2pStatusRead, p2pStatusWrite;
 };

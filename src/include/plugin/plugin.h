@@ -10,6 +10,7 @@
 
 #include "nccl.h"
 
+// 插件类型有 6 种
 enum ncclPluginType {
   ncclPluginTypeNet,
   ncclPluginTypeGin,

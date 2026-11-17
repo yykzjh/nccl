@@ -9,6 +9,7 @@
 #include "debug.h"
 
 extern "C" void* ncclParamRegistryInstance() {
+  // 函数内静态变量，确保只创建一次
   static ncclParamRegistry::registryState state;
   return &state;
 }

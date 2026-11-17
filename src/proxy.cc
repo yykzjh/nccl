@@ -2113,20 +2113,64 @@ void* ncclProxyServiceUDS(void* _args) {
 }
 
 ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
+                           /*
+                           proxyState 是共享资源(挂在 sharedRes 上)，一个共享组只建一次。
+                           assert 防重复建(重复会泄漏旧对象 + 破坏共享语义)。
+                           */
                            uint64_t* peerAddressesUDS) {
   if (comm->sharedRes->proxyState != nullptr) {
     WARN("Proxy state is already initialized");
     return ncclInternalError;
   }
+  /*
+    堆分配：proxyState 跨 comm 共享、生命周期长于单个 comm(被 split 子 comm 继承)、被两个服务线程长期持有，不能放栈上。
+    {} 值初始化：所有成员清零(指针→nullptr、int→0、bool→false、std::thread 默认构造为不可 join)。
+  故没显式赋值的字段(comm/tpRank/thread/threadUDS/peerSocks/progressState…)都是干净零值，留待 ncclProxyCreate 填。
+  */
   comm->sharedRes->proxyState = new ncclProxyState{};
+  // 两级指针：sharedRes->proxyState 是共享所有权锚点，comm->proxyState 是本 comm 的访问指针，都指向同一对象。
   comm->proxyState = comm->sharedRes->proxyState;
+  /*
+  owner 建时 = 1；
+  split 子 comm refCount++；
+  ncclProxyCreate 里 if (refCount==1) 才做重活，sharer 跳过；
+  销毁：ncclProxyStop 里 refCount 减到 0 才发 ncclProxyMsgStop、关 peer socks、置 stop=1；
+  ncclProxyDestroy 里 assert(refCount==0) 才释放，commFree 里减到 0 才 join 线程。
+  */
   comm->proxyState->refCount = 1;
+  /*
+  接管 proxySocket，随后 ncclProxyService(TCP 服务线程)把它放进 pollfds[maxProxyConnections] 槽，
+  accept 进来的 proxy 控制连接，所有权从 bootstrap 局部变量移交到 proxyState->listenSock。
+  */
   comm->proxyState->listenSock = sock;
+  /*
+  接管 state->peerProxyAddresses(长度 nranks)，主线程用它主动 connect 到别的 rank 的 proxy，ncclProxyStop 里也用它给自己 proxy 发 stop。
+  */
   comm->proxyState->peerAddresses = peerAddresses;
+  /*
+  接管 state->peerProxyAddressesUDS，用于 cuMem fd 传递的 rendezvous，proxyCallUDS 里取出对端 hash，拼出对端 AF_UNIX 名，sendto。
+  */
   comm->proxyState->peerAddressesUDS = peerAddressesUDS;
+  /*
+  NCCL_NET_ATTR_INIT 是宏，把 ncclNetAttr_t 所有字段置 NCCL_NET_ATTR_UNDEF。
+  该结构描述网络通信属性(sendCommAttr/recvCommAttr 的 min/maxConcurrentPeers、min/maxFlowsPerPeer、op 操作位掩码)。
+  这里是"尚未填充"的哨兵值，后续按连接填真值，net 插件的 setNetAttr 可覆盖。
+  */
   comm->proxyState->netAttr = NCCL_NET_ATTR_INIT;
 
   // UDS support
+  /*
+  建本 rank 持久的 UDS 端点(proxyState->ipcSock):
+    内部 snprintf 拼 /tmp/nccl-socket-<rank>-<hash>，socket(AF_UNIX, SOCK_DGRAM)，bind(默认 abstract namespace,sun_path[0]='\0')。
+    这是接收端/服务端：别的进程要给我传 fd 时，用我的 hash 拼出我的名字 sendto 过来。
+  TCP 传不了 fd：
+    fd 是进程私有的内核对象，跨进程无意义。要在进程间传 fd，必须用 AF_UNIX + SCM_RIGHTS 辅助数据。
+    cuMem(CUDA VMM)分配产出 POSIX FD 句柄(cuMemExportToShareableHandle → fd)，同节点的另一个进程要 import 它，只能靠 UDS 把 fd 递过去。
+  所以 proxy 跑了两个服务线程(ncclProxyCreate 启动):
+  线程	        入口	                  名字	                    poll 的端点	          职责
+  thread	     ncclProxyService	       "NCCL Service %2d"	      listenSock(TCP)	     控制面:处理 ncclProxyMsg*
+  threadUDS	   ncclProxyServiceUDS	   "NCCL UDS Service %2d"	  ipcSock(AF_UNIX)	   fd 传递面:SCM_RIGHTS 收发 fd
+  */
   NCCLCHECK(ncclIpcSocketInit(&comm->proxyState->ipcSock, comm->rank, peerAddressesUDS[comm->rank], comm->abortFlag));
   return ncclSuccess;
 }

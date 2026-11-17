@@ -25,6 +25,7 @@ typedef ncclNvlDomainInfo_v7_t ncclNvlDomainInfo_t;
 
 #define NCCL_TUNER_PLUGIN_SYMBOL "ncclTunerPlugin_v7"
 
+// 定义如下 7 种算法的 ID
 #define NCCL_ALGO_UNDEF -1
 #define NCCL_ALGO_TREE 0
 #define NCCL_ALGO_RING 1
@@ -33,8 +34,9 @@ typedef ncclNvlDomainInfo_v7_t ncclNvlDomainInfo_t;
 #define NCCL_ALGO_NVLS 4
 #define NCCL_ALGO_NVLS_TREE 5
 #define NCCL_ALGO_PAT 6
-#define NCCL_NUM_ALGORITHMS NCCL_NUM_ALGORITHMS_V5 // Tree/Ring/CollNet*/PAT
+#define NCCL_NUM_ALGORITHMS NCCL_NUM_ALGORITHMS_V5 // Tree/Ring/CollNet*/NVLS*/PAT
 
+// 定义如下 3 种协议的 ID
 #define NCCL_PROTO_UNDEF -1
 #define NCCL_PROTO_LL 0
 #define NCCL_PROTO_LL128 1
@@ -44,11 +46,13 @@ typedef ncclNvlDomainInfo_v7_t ncclNvlDomainInfo_t;
 #define NCCL_TUNING_IGNORE -1.0
 #define NCCL_ALGO_PROTO_IGNORE NCCL_TUNING_IGNORE
 
+// 定义如下 3 种硬件链路类型的 ID
 #define NCCL_HW_NVLINK 0
 #define NCCL_HW_PCI 1
 #define NCCL_HW_NET 2
 #define NCCL_NUM_HW_LINKS NCCL_NUM_HW_LINKS_V5
 
+// 定义如下 4 种 CUDA 计算能力的 ID
 #define NCCL_VOLTA_COMPCAP_IDX 0
 #define NCCL_AMPERE_COMPCAP_IDX 1
 #define NCCL_HOPPER_COMPCAP_IDX 2
@@ -56,6 +60,7 @@ typedef ncclNvlDomainInfo_v7_t ncclNvlDomainInfo_t;
 #define NCCL_RUBIN_COMPCAP_IDX 4
 #define NCCL_NUM_COMPCAPS NCCL_NUM_COMPCAPS_V7
 
+// 定义如下 3 种调优规模的 ID
 #define NCCL_TUNING_SCALE_1NODE 0
 #define NCCL_TUNING_SCALE_2NODES 1
 #define NCCL_TUNING_SCALE_4NODES 2

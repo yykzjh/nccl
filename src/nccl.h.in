@@ -101,6 +101,7 @@ typedef enum {
 
 /* Communicator configuration. Users can assign value to attributes to specify the
  * behavior of a communicator. */
+// NCCL Config 类型定义，一般是 communicator 层级的配置
 typedef struct ncclConfig_v23100 {
   /* attributes that users should never touch. */
   size_t size;
@@ -132,6 +133,7 @@ typedef struct ncclConfig_v23100 {
   int nvlsHostMode;
 } ncclConfig_t;
 
+// NCCL Config 初始化宏，必须用该宏创建 ncclConfig_t，否则 magic 检测报错
 /* Config initializer must be assigned to initialize config structure when it is created.
  * Not initialized config will result in NCCL error. */
 #define NCCL_CONFIG_INITIALIZER {                                       \

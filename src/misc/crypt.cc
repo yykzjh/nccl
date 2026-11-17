@@ -619,6 +619,7 @@ ncclResult_t ncclCryptStartConnect(struct ncclSocket* sock) {
   return ncclSuccess;
 }
 
+// magic 与 type 组成一个 hello 缓冲；发送未完成时返回 ncclInProgress，下次从 finalizeCounter 继续。
 ncclResult_t ncclCryptConnectHello(struct ncclSocket* sock) {
   if (sock->finalizeCounter < NCCL_SOCKET_PLAIN_HELLO_BYTES) {
     if (sock->crypto != nullptr) {
@@ -639,6 +640,7 @@ ncclResult_t ncclCryptConnectHello(struct ncclSocket* sock) {
   return ncclSuccess;
 }
 
+// 统一接收 socket hello：异步路径通过 finalizeCounter 续读，收齐后校验 magic 与 type；启用 TLS 时先握手。
 ncclResult_t ncclCryptAcceptHello(struct ncclSocket* sock, enum ncclCryptHelloVerdict* verdict) {
   uint64_t magic;
   enum ncclSocketType type;
@@ -709,6 +711,7 @@ ncclResult_t ncclCryptAcceptHello(struct ncclSocket* sock, enum ncclCryptHelloVe
     }
   }
 
+  // hello 已完整接收，再从同一个缓冲中解析 magic 和 type；不匹配时请求上层重置本次连接。
   memcpy(&magic, sock->finalizeBuffer, sizeof(magic));
   if (magic != sock->magic) {
     // A TLS ClientHello arriving at a plaintext listener also lands here: the

@@ -49,7 +49,8 @@ struct cudaLaunchParams {
 
 #define CACHE_LINE_SIZE 128
 #define MEM_ALIGN 4096
-#define CUDA_IPC_MIN 2097152UL
+// 全仓做 IPC 可共享显存时统一的"最小一块"约定，GPU 的可共享分配有最小粒度,就是 2MB(大页粒度)
+#define CUDA_IPC_MIN 2097152UL  // 2MB
 
 // Channels / LL tuning
 #define NCCL_LL_THREAD_THRESHOLD 8
@@ -101,9 +102,9 @@ struct ncclNodeRanks {
 };
 
 struct cliqueInfo {
-  int id;
-  int size;
-  int* ranks;
+  int id;  // NVLink fabric 域内的 clique 标识
+  int size;  // clique 成员数
+  int* ranks;  // 成员的全局 rank 列表，ranks[k] = 组内第 k 个成员的全局 rank 号
 };
 
 struct ncclDestructor {
@@ -136,30 +137,49 @@ ncclResult_t ncclUncapturedStreamPoolAcquire(struct ncclUncapturedStreamPool* po
 ncclResult_t ncclUncapturedStreamPoolDestroy(struct ncclUncapturedStreamPool* pool);
 
 struct ncclSharedResources {
-  int refCount;
-  struct ncclComm* owner; /* comm which creates this shared res. */
-  struct ncclChannelPeer* peers[MAXCHANNELS];
-  struct ncclDevChannelPeer* devPeers[MAXCHANNELS];
+  // 引用管理与归属
+  int refCount;  // 原子引用计数。有多少个 comm 正引用这份共享资源；归零时才真正析构。
+  struct ncclComm* owner; /* comm which creates this shared res. */  // 指向创建这份资源的原始 comm
+  // 传输连接资源（最核心）
+  struct ncclChannelPeer* peers[MAXCHANNELS];  // 每个 channel 的 host 侧 peer 连接数组
+  struct ncclDevChannelPeer* devPeers[MAXCHANNELS];  // 每个 channel 的 device 侧 peer 连接数组
+  // 操作计数器
   /* P2P operation counter, one per channel */
-  uint64_t p2pOpCount[MAXCHANNELS];
+  uint64_t p2pOpCount[MAXCHANNELS];  // 每 channel 的 P2P 操作序号计数器
   /* Collective operation counter */
-  uint64_t collOpCount;
-  int tpNRanks;
-  int tpNLocalRanks;
-  int tpNChannels;
-  int tpP2pNChannels;
-  int tpP2pChunkSize;
-  uint64_t magic;
+  uint64_t collOpCount;  // 集合操作计数器（所有共享 comm 累加）
+  /*
+  top parent 拓扑约束参数。前缀 tp = top parent。
+  因为子 comm 复用父 comm 的连接资源，它的很多参数不能超过父 comm 建立资源时的容量，否则会越界访问共享数组。
+  这些值只由 owner 回填，子 comm 读取时用 std::min 收敛。
+  */
+  int tpNRanks;  // top parent 的总 rank 数
+  int tpNLocalRanks;  // top parent 在本节点的本地 rank 数
+  int tpNChannels;  // top parent 的 channel 数
+  int tpP2pNChannels;  // top parent 的 P2P channel 数
+  int tpP2pChunkSize;  // top parent 的 P2P chunk 大小
+  uint64_t magic;  // 由 owner 从 comm->magic 复制
 
   // top parent rank to localRank translation table
-  int* tpRankToLocalRank;
+  int* tpRankToLocalRank;  // top parent rank → localRank 的转换表
+  // 内部 CUDA 流与同步对象
   // Internal streams
+  /*
+  两个 ncclStrongStream（可安全用于 CUDA Graph capture 的流封装），
+  分别承载设备侧与主机侧内部工作，通过 ncclStrongStreamAcquire/Release 配对串行化并发访问。
+  */
   struct ncclStrongStream deviceStream, hostStream;
-  int persistentRefs;
+  int persistentRefs;  // 记录有多少个持久化 kernel plan（被 CUDA Graph 捕获的 plan）正引用这份资源
+  /*
+  launchEvent：以 cudaEventDisableTiming 创建，用作 kernel 的 launch-completion event
+  scratchEvent：通用临时同步事件，用于在多个 user stream / 内部 stream 之间建立依赖
+  */
   cudaEvent_t launchEvent, scratchEvent;
   struct ncclUncapturedStreamPool uncapturedStreamPool;
 
+  // 共享的 proxy 状态（负责网络传输进度推进的后台机制）
   /* proxy related shared res */
+  // GIN（GPU-Initiated Networking，GPU 发起式网络通信）状态
   struct ncclProxyState* proxyState;
 };
 
@@ -734,7 +754,9 @@ struct ncclComm {
   uint32_t workFifoConsumed;
 
   // Intra-process sync
+  // intraComm0 是链头（组长自己），从它出发沿 intraNext 走能遍历到进程内每一个 comm（组长自己 + 所有兄弟，顺序是 rank 降序）
   struct ncclComm* intraComm0; // leader of intra-process comms (self possible)
+  // 每个进程的组长 comm 维护的链表
   struct ncclComm* intraNext; // next of intra-process comms, intraComm0 is head
   int intraRank;
   int intraRanks;
@@ -748,7 +770,7 @@ struct ncclComm {
   int proxyRefCountOld; /* store proxy post-atomic-sub refcount */
   // Whether this communicator uses collNet
   bool isOneRPN;
-  uint8_t collNetSupportMatrix[4 /*sum,prod,max,min*/][ncclNumTypes];
+  uint8_t collNetSupportMatrix[4 /*sum,prod,max,min*/][ncclNumTypes]; // 12
   int* collNetHeads;
   int collNetHeadsNum;
   int collNetChainSupport;
@@ -763,6 +785,14 @@ struct ncclComm {
   /* sharable NVLS resource. */
   struct ncclNvlsSharedRes* nvlsResources;
 
+  /*
+  池不自己拥有内存，它的内存全部来自 memPermanent 这个栈。池只是在这些内存之上做"回收再利用"的一层。所以三者的关系是：
+    memPermanent（栈，只增不减，comm 销毁时整体释放）
+          ↑ 需要新格子时向它 bump 一块
+    memPool_xxx（free list，回收的格子挂在这里循环用）
+          ↑ Alloc/Free
+    ncclKernelPlan / ncclProxyOp / ncclTaskColl ...（高频短命对象）
+  */
   // pools backed by comm->memPermanent
   struct ncclMemoryPool memPool_ncclTaskBcast;
   struct ncclMemoryPool memPool_ncclTaskColl;

@@ -25,6 +25,7 @@ static int ncclCuMemSupported = 0;
 
 // Determine whether CUMEM & VMM RDMA is supported on this platform
 int ncclIsCuMemSupported() {
+  // CUDART 版本小于 11.03.00 或者是 Windows 平台，则不支持 CUMEM
 #if CUDART_VERSION < 11030 || defined(NCCL_OS_WINDOWS)
   return 0;
 #else
@@ -34,10 +35,13 @@ int ncclIsCuMemSupported() {
   int flag = 0;
   ncclResult_t ret = ncclSuccess;
   CUDACHECKGOTO(cudaDriverGetVersion(&cudaDriverVersion), ret, error);
+  // CUDA 驱动版本 < 12.0，不启用 CUMEM
   if (cudaDriverVersion < 12000) return 0;  // Need CUDA_VISIBLE_DEVICES support
   CUDACHECKGOTO(cudaGetDevice(&cudaDev), ret, error);
+  // 没有 cuMemCreate 符号，不启用 CUMEM
   if (CUPFN(cuMemCreate) == NULL) return 0;
   CUCHECKGOTO(cuDeviceGet(&currentDev, cudaDev), ret, error);
+  // 查询是否有 CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED 属性判断 CUMEM VMM 是否支持
   // Query device to see if CUMEM VMM support is available
   CUCHECKGOTO(cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, currentDev), ret,
               error);
@@ -76,11 +80,13 @@ static int ncclCuMemHostProbeCache[NCCL_MAX_LOCAL_RANKS] = {};
 
 // Return whether the CUDA version and NCCL_CUMEM_HOST_ENABLE policy allow
 // attempting cuMem host allocations. This does not probe the current device.
+// 准入策略：先检查 CUDA 版本和用户开关；自动模式检查驱动版本，实际分配能力还要逐设备探测。
 static bool ncclCuMemHostAllowed(int cudaApiVersion) {
 #if CUDART_VERSION < 12020
   (void)cudaApiVersion;
   return false;
 #else
+  // CUDA 驱动版本 < 12.2 不启用
   if (cudaApiVersion < 12020) return false;
   int paramValue = ncclParamCuMemHostEnable();
   if (paramValue != -1) return paramValue;
@@ -108,6 +114,8 @@ bool ncclCuMemHostEnable() {
   bool ncclCumemHostEnable = false;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&cudaApiVersion), ret, error);
   ncclCumemHostEnable = ncclCuMemHostAllowed(cudaApiVersion);
+  // 即使配置决定启用，NCCL 也不会直接假设功能可用，而是尝试创建一块最小的 Host 内存分配。
+  // 这是因为某些容器环境虽然 CUDA Driver 支持该 API，但 NUMA 相关系统调用可能被容器权限限制。
   if (ncclCumemHostEnable) {
     // Verify that host allocations actually work.  Docker in particular is known to disable "get_mempolicy",
     // causing such allocations to fail (this can be fixed by invoking Docker with "--cap-add SYS_NICE").
@@ -147,8 +155,11 @@ error:
 #endif
 }
 
+// PFN_##symbol##_v##version 定义在 CUDA Toolkit 的 cudaTypedefs.h 头文件中
+// 如下举例类似：PFN_cuMemCreate_v10020 pfn_cuMemCreate = nullptr;
 #define DECLARE_CUDA_PFN(symbol, version) PFN_##symbol##_v##version pfn_##symbol = nullptr
 
+// 定义统一的 CUDA API 函数指针
 #if CUDART_VERSION >= 11030
 /* CUDA Driver functions loaded with cuGetProcAddress for versioning */
 DECLARE_CUDA_PFN(cuInit, 2000);
@@ -236,6 +247,7 @@ bool ncclCudaLaunchBlocking = false;
 #if CUDART_VERSION >= 11030
 
 #if CUDART_VERSION >= 13000
+// 加载指定 CUDA API 符号， version 指定版本语义，ignore 如果当前 CUDA 版本不支持则是否可以忽略
 #define LOAD_SYM(symbol, version, ignore) \
   do { \
     cudaDriverEntryPointQueryResult driverStatus = cudaDriverEntryPointSymbolNotFound; \
@@ -361,6 +373,7 @@ static ncclResult_t initResult;
 static void initOnceFunc() {
   do {
     const char* val = ncclGetEnv("CUDA_LAUNCH_BLOCKING");
+    // 判断 CUDA_LAUNCH_BLOCKING 环境变量是否设置为 1
     ncclCudaLaunchBlocking = val != nullptr && val[0] != 0 && !(val[0] == '0' && val[1] == 0);
   } while (0);
 
@@ -369,9 +382,16 @@ static void initOnceFunc() {
   int driverVersion;
   CUDACHECKGOTO(cudaGetDevice(&cudaDev), ret, error); // Initialize the driver
 
+  // 获取 CUDA 驱动版本
   CUDACHECKGOTO(cudaDriverGetVersion(&driverVersion), ret, error);
   INFO(NCCL_INIT, "cudaDriverVersion %d", driverVersion);
 
+  /*
+  版本使用整数编码，例如：
+  11030：CUDA 11.3
+  12020：CUDA 12.2
+  12030：CUDA 12.3  
+  */
   if (driverVersion < CUDA_DRIVER_MIN_VERSION) {
     // WARN("CUDA Driver version found is %d. Minimum requirement is %d", driverVersion, CUDA_DRIVER_MIN_VERSION);
     // Silently ignore version check mismatch for backwards compatibility
@@ -379,15 +399,31 @@ static void initOnceFunc() {
   }
 
 #if CUDART_VERSION >= 11030
+  // 检测并加载 NCCL 需要的 CUDA API，统一采用 pfn 方式
   if (cudaPfnFuncLoader()) {
     WARN("CUDA some PFN functions not found in the library");
     goto error;
   }
 #endif
 
+  // 判断是否支持 cuMem APIs
+  /*
+  它主要检查：
+    Driver 版本是否满足要求，大于 12000
+    cuMemCreate 等函数是否存在，查看统一 pfn_* 函数指针是否为空
+    当前 GPU 是否支持 Virtual Memory Management；
+    当前平台是否支持相关功能。
+  */
   // Determine whether we support the cuMem APIs or not
   ncclCuMemSupported = ncclIsCuMemSupported();
 
+  // 使用 cuMem API 分配主机（CPU）内存，必须在每个可见 GPU 上先创建 CUDA context。这是 CUDA 12.2 和 12.3 中需要的 workaround，在 12.4 中已修复。
+  /*
+  主要逻辑为：
+    1.遍历所有可见 GPU
+    2.对每个 GPU 调用 cudaFree(NULL) —— 这个调用会隐式创建 CUDA context
+    3.完成后恢复原来的设备
+  */
   /* To use cuMem* for host memory allocation, we need to create context on each visible device.
    * This is a workaround needed in CUDA 12.2 and CUDA 12.3 which is fixed in 12.4. */
   if (ncclCuMemSupported && ncclCuMemEnable() && 12020 <= driverVersion && driverVersion <= 12030 &&

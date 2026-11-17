@@ -77,7 +77,7 @@ struct ncclDevRedOpFull {
 };
 
 #define WARP_SIZE 32
-#define MAXCHANNELS 64
+#define MAXCHANNELS 64  // 表示一个 comm 最多能用多少个通信 channel（NCCL 把 GPU 之间的数据流拆到多个并行 channel 上跑）
 #define NCCL_MAX_CGA_CLUSTER_SIZE 8
 #define NCCL_MAX_LOCAL_RANKS 144
 #define NCCL_MAX_NTHREADS 640

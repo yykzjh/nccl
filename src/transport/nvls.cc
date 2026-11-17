@@ -56,6 +56,9 @@ static ncclResult_t nvlsFreeUc(struct ncclComm* comm, struct ncclNvlsUcSegment* 
 
 #define NVLS_MEM_ALIGN_SIZE (1 << 21)
 
+/*
+NCCL_NVLS_ENABLE=2(默认)：自动探测。1 强制开启，不做任何能力探测。0 强制关闭
+*/
 NCCL_PARAM(NvlsEnable, "NVLS_ENABLE", 2);
 NCCL_PARAM(NvlsChunkSize, "NVLS_CHUNKSIZE", 128 * 1024);
 NCCL_PARAM(NvlsTreeMaxChunkSize, "NVLSTREE_MAX_CHUNKSIZE", -2);
@@ -236,12 +239,16 @@ ncclResult_t ncclNvlsTuning(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+/*
+在完全不知道拓扑图长什么样之前，仅凭「有没有多 rank 共用一块卡」和「硬件支不支持 multicast」先做一个粗糙判断。
+后续还有三道独立关卡会推翻它，主要的两处是图搜索结果的全局取交集和建连失败兜底。
+*/
 ncclResult_t ncclNvlsInit(struct ncclComm* comm) {
   comm->nvlsSupport = 0;
   comm->nvlsChannels = 0;
 
   if (comm->hasMultiRankNvml) {
-    if (ncclParamNvlsEnable() == 1) {
+    if (ncclParamNvlsEnable() == 1) {  // 启用了 NVLS 但是有多个 rank 共用一张卡，报错
       WARN("NCCL_NVLS_ENABLE has been set to \"1\" and communicator has multiple ranks using the same NVML device. "
            "This is not compatible with NCCL_NVLS_ENABLE=1.");
       return ncclInvalidUsage;
@@ -249,21 +256,21 @@ ncclResult_t ncclNvlsInit(struct ncclComm* comm) {
     return ncclSuccess;
   }
   int gpuCount;
-  NCCLCHECK(ncclTopoGetGpuCount(comm->topo, &gpuCount));
-  if (!ncclParamNvlsEnable() || gpuCount < 2) return ncclSuccess;
+  NCCLCHECK(ncclTopoGetGpuCount(comm->topo, &gpuCount));  // 获取 GPU 顶点数量
+  if (!ncclParamNvlsEnable() || gpuCount < 2) return ncclSuccess;  // 如果没启用 NVLS 或者 GPU 顶点只有一个，直接返回
 
   CUdevice dev;
   int driverVersion;
 
   if (CUPFN(cuDeviceGet) == NULL) return ncclSuccess;
-  CUCHECK(cuCtxGetDevice(&dev));
-  CUDACHECK(cudaDriverGetVersion(&driverVersion));
+  CUCHECK(cuCtxGetDevice(&dev));  // 获取当前 device
+  CUDACHECK(cudaDriverGetVersion(&driverVersion));  // 获取 CUDA 驱动版本
   if (ncclParamNvlsEnable() == 2) {
     // NVLS Multicast support requires CUDA12.1 UMD + KMD
-    if (CUPFN(cuMulticastCreate) != NULL /*&& driverVersion >= 12010 */) {
-      CUCHECK(cuDeviceGetAttribute(&comm->nvlsSupport, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev));
+    if (CUPFN(cuMulticastCreate) != NULL /*&& driverVersion >= 12010 */) {  // 探测是否存在 CUDA12.1 才有的 cuMulticastCreate API
+      CUCHECK(cuDeviceGetAttribute(&comm->nvlsSupport, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev));  // 获取 CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED 属性
     }
-  } else {
+  } else {  // 1 强制开启 NVLS
     comm->nvlsSupport = 1;
   }
 

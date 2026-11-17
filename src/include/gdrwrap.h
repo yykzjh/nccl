@@ -61,6 +61,16 @@ typedef enum gdr_pin_flags {
 #define GPU_PAGE_OFFSET  (GPU_PAGE_SIZE-1)
 #define GPU_PAGE_MASK    (~GPU_PAGE_OFFSET)
 
+// 运行时加载 GDRCopy 动态库需要自己定义涉及到的数据类型
+
+/*
+gdr 数据类型是从 GDRCopy gdr_open API 获取的句柄，不是自己创建的，也没有具体用到它，例如：
+  struct gdr obj;
+  sizeof(struct gdr);
+  handle->xxx;
+
+  由 GDRCopy API 完全管理 gdr 类型的生命周期，所以不用显示定义 gdr 结构体的内部字段
+*/
 struct gdr;
 typedef struct gdr *gdr_t;
 
@@ -131,11 +141,14 @@ typedef struct gdr_mem_desc {
   gdr_mh_t gdrMh;
 } gdr_mem_desc_t;
 
+// 头文件里的 static 函数会被 #include 复制到每个源文件中，本质上每个 .cc 文件都有自己的一份私有拷贝
 static gdr_t ncclGdrInit() {
   int libMajor = 0, libMinor = 0, drvMajor = 0, drvMinor = 0;
   gdr_t handle = NULL;
+  // 动态加载 GDRAPI 动态库中需要的函数
   // Dynamically load the GDRAPI library symbols
   if (wrap_gdr_symbols() == ncclSuccess) {
+    // 调用 gdr_internal_open()，即 gdr_open()，返回 GDRCopy driver handle
     handle = wrap_gdr_open();
     if (handle == NULL && ncclGdrIsInternalDmaBufBackend()) {
       INFO(NCCL_INIT, "NCCL internal DMA-BUF mmap backend unavailable");
@@ -150,9 +163,11 @@ static gdr_t ncclGdrInit() {
       }
 
       // Query the version of libgdrapi
+      // 查询 libgdrapi.so 的版本
       NCCLCHECKGOTO(wrap_gdr_runtime_get_version(&libMajor, &libMinor), res, error);
 
       // Only support GDRAPI 2.1 and later
+      // 仅支持 libgdrapi >= 2.1 且 gdrdrv >= 2.1
       if (libMajor < 2 || (libMajor == 2 && libMinor < 1)) {
         goto error;
       }
@@ -164,6 +179,7 @@ static gdr_t ncclGdrInit() {
           wrap_gdr_is_dma_buf_mmap(handle, &usingDmaBuf) == ncclSuccess && usingDmaBuf) {
         INFO(NCCL_INIT, "GDRCOPY enabled library %d.%d using DMA-BUF mmap backend", libMajor, libMinor);
       } else {
+        // 查询 kernel driver gdrdrv 的版本
         NCCLCHECKGOTO(wrap_gdr_driver_get_version(handle, &drvMajor, &drvMinor), res, error);
         if (drvMajor < 2 || (drvMajor == 2 && drvMinor < 1)) goto error;
         INFO(NCCL_INIT, "GDRCOPY enabled library %d.%d driver %d.%d", libMajor, libMinor, drvMajor, drvMinor);
@@ -172,6 +188,7 @@ static gdr_t ncclGdrInit() {
   }
   return handle;
 error:
+  // 关闭已经打开的 GDRCopy handle
   if (handle != NULL) (void) wrap_gdr_close(handle);
   return NULL;
 }

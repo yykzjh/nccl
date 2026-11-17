@@ -23,30 +23,41 @@
 
 // Convert local_cpus, e.g. 0003ff,f0003fff to ncclAffinity.
 // The bitmask is divided into chunks of 32 bits, each of them represented by 8 hex number.
+/*
+bitmask 被切成 32 位一段、每段用 8 个十六进制数表示，逗号分隔，最高位段在最左。
+所以 0003ff,f0003fff 里 0003ff 是高位段（管 CPU 32–63）、f0003fff 是低位段（管 CPU 0–31）。
+*/
+// 每个 chunk 用 32 位（uint32_t）表示
 #define U32_LEN 32 // using uint32_t
+// 需要几个 chunk，Linux 1024/32 = 32 个、Windows 64/32 = 2 个
 #define CPU_SET_N_U32 (CPU_SETSIZE / U32_LEN)
 
+// 把 Linux sysfs 的十六进制 CPU 掩码字符串（例如 0003ff,f0003fff）解析成 ncclAffinity 集合，最终供 ncclTopoGetCpuAffinity 绑核用。
 static ncclResult_t ncclStrToCpuset(const char* maskStr, ncclAffinity* set, int cpuOffset = 0) {
   if (cpuOffset < 0 || cpuOffset >= CPU_SETSIZE) return ncclInvalidArgument;
+  // 一个 chunk 数组（Linux 32 个、Windows 2 个）清零，用来暂存解析出的各 32 位段
   uint32_t cpumasks[CPU_SET_N_U32] = {0};
 
+  // 字符串 → chunk 数组（高位在前，倒着填）
   // transform the string into an array of 32 bit masks, starting with the highest mask
-  int m = CPU_SET_N_U32;
-  char* str = strdup(maskStr);
+  int m = CPU_SET_N_U32;  // 数组倒着填写
+  char* str = strdup(maskStr);  // 临时拷贝字符串
   char* savePtr = NULL;
-  char* token = strtok_r(str, ",", &savePtr);
+  char* token = strtok_r(str, ",", &savePtr);  // 逗号分隔
   while (token != NULL && m > 0) {
     cpumasks[--m] = strtoul(token, NULL, /*base = hex*/ 16);
     token = strtok_r(NULL, ",", &savePtr);
   }
   free(str);
 
+  // chunk 数组 → CPU 集合（从最低有效段起，展开每一位）
   // list all the CPUs as part of the CPU set, starting with the lowest mask (= current value of m)
-  ncclOsCpuZero(*set);
-  for (int a = 0; (a + m) < CPU_SET_N_U32; a++) {
+  ncclOsCpuZero(*set);  // 清空 cpu mask
+  for (int a = 0; (a + m) < CPU_SET_N_U32; a++) {  // 从有数据的 chunk 开始遍历
     // each mask is U32_LEN CPUs, list them all if the bit is on
-    for (int i = 0; i < U32_LEN; ++i) {
+    for (int i = 0; i < U32_LEN; ++i) {  // 遍历每个 chunk 中的 bit
       int cpu = cpuOffset + i + a * U32_LEN;
+      // 该 bit 对应的 cpu 为 1，调用 glibc 宏设置 cpu mask
       if (cpu < CPU_SETSIZE && (cpumasks[a + m] & (1UL << i))) ncclOsCpuSet(*set, cpu);
     }
   }

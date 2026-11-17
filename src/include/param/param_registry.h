@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <mutex>
 
+// 按照 C 语言 ABI 导出的单例访问函数，返回的指针指向 RegistryState（注册表真正保存状态）
 // C-linkage singleton accessor — exported as "ncclParamRegistryInstance"
 // Returns a process-wide RegistryState so map and mutex share identity across DSOs.
 extern "C" void* ncclParamRegistryInstance();
@@ -50,11 +51,14 @@ public:
   };
 
   using mapType = std::unordered_map<std::string, mapEntry>;
+
+  // 注册表状态结构体，包含参数映射表和互斥锁
   struct registryState {
     mapType map;
     std::mutex mtx;
   };
 
+  // 从单例访问函数获取单例注册表状态
   static registryState& state() {
     return *static_cast<registryState*>(ncclParamRegistryInstance());
   }

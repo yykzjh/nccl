@@ -16,19 +16,25 @@
 #include <array>
 #include <cstring>
 
+// 把字符串解析成类型 T 的解析器
 // ncclParamParser: Runtime parser interface ncclParam depends on
 template <typename T>
 struct ncclParamParser {
+  // 把字符串解析成 T 类型的值
   using resolveFn_t = ncclResult_t (*)(const void*, const char*, T&);
+  // 检查解析后的值是否合法
   using validateFn_t = bool (*)(const void*, const T&);
+  // 把当前参数值转换回字符串
   using toStringFn_t = std::string (*)(const void*, const T&);
 
   resolveFn_t resolveFn = nullptr;
   validateFn_t validateFn = nullptr;
   toStringFn_t toStringFn = nullptr;
+  // 保存解析器所需的额外数据，例如枚举解析器的选项表
   std::shared_ptr<const void> ctx;  // owns factory state; nullptr for stateless parsers
   std::string desc;  // Description of accepted values
 
+  // 包装方法，把 ctx.get() 传进去
   // Wrapper methods — preserve parser.resolve(...) call syntax
   ncclResult_t resolve(const char* input, T& out) const {
     return resolveFn(ctx.get(), input, out);
@@ -68,6 +74,7 @@ struct ncclOption {
   const char* desc;  // Per-option description (nullptr when no description)
 };
 
+// 固定大小 std::arrary 保存所有选项
 // ncclOptionSet: Fixed-size option set (compile-time N, zero heap allocation)
 template <typename T, size_t N>
 struct ncclOptionSet {
@@ -84,6 +91,7 @@ struct ncclOptionSet {
   }
 };
 
+// 检查选项不重复
 // assert no two options share the same name.
 template <typename T, size_t N>
 inline void ncclOptionSetAssertUnique(const ncclOptionSet<T, N>& opts) {

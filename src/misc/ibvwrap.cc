@@ -228,6 +228,7 @@ ncclResult_t wrap_ibv_reg_dmabuf_mr(struct ibv_mr** ret, struct ibv_pd* pd, uint
 
 struct ibv_mr* wrap_direct_ibv_reg_dmabuf_mr(struct ibv_pd* pd, uint64_t offset, size_t length, uint64_t iova, int fd,
                                              int access) {
+  // 如果运行的 rdma-core 版本太老、压根没有 ibv_reg_dmabuf_mr 这个符号（动态加载时解析为 NULL），这里手动把 errno 设成 EOPNOTSUPP。
   if (ibvSymbols.ibv_internal_reg_dmabuf_mr == NULL) {
     errno = EOPNOTSUPP; // ncclIbDmaBufSupport() requires this errno being set
     return NULL;

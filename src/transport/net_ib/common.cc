@@ -14,7 +14,7 @@ union ncclSocketAddress ncclIbIfAddr;
 int ncclNMergedIbDevs = -1;
 int ncclNIbDevs = -1;
 struct ncclIbMergedDev ncclIbMergedDevs[MAX_IB_VDEVS];
-struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
+struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];  // 全局数组 ncclIbDevs 存所有物理设备
 int ncclIbRelaxedOrderingEnabled = 0;
 uint64_t ncclIbSpeedChangeCounter = 0;
 

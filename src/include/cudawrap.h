@@ -27,6 +27,7 @@ extern CUmemAllocationHandleType ncclCuMemHandleType;
 
 #endif
 
+// 从 CUDA API 获取 NCCL pfn 统一函数指针
 #define CUPFN(symbol) pfn_##symbol
 
 // Emit an actionable hint for a subset of well-known CUDA driver errors.

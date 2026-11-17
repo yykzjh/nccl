@@ -266,6 +266,7 @@ static inline cudaError_t cuda_clear(cudaError_t err) {
 
 #define NEW_NOTHROW_GOTO(var, x, RES, label) \
   do { \
+    // std::nothrow 让 operator new 失败时返回 nullptr 而不是抛 std::bad_alloc，NCCL 对外是 C ABI，异常绝不能穿出库边界
     (var) = new (std::nothrow) x{}; \
     if (!(var)) { \
       WARN("Allocation failed"); \
