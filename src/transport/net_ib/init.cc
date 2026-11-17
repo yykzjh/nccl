@@ -8,8 +8,18 @@
 #include "common.h"
 #include "p2p_resiliency_recovery.h"
 
+// PCIe 松散序开关：0 强制关，非 0（1/2）在 API 支持时开
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
+/*
+自适应路由：-2 = 按链路类型自动（IB 开、RoCE 关），其他值强制覆盖。
+让数据包动态走不同路径绕过拥塞热点做负载均衡，而不是所有包挤一条固定路由。代价是包可能乱序到达（不同路径延迟不同）。
+*/
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+/*
+默认为 1，NCCL 内部创建 1 个 ncclIbDevs 条目
+=2，NCCL 内部创建 2 个 ncclIbDevs 条目（常规 + data-direct）
+=0 或硬件不支持，NCCL 内部创建 1 个常规 ncclIbDevs 条目
+*/
 NCCL_PARAM(IbDataDirect, "IB_DATA_DIRECT", 1);
 
 // default to 0 to disable ooo rq, if set to 1, ooo rq will be enabled or failed
@@ -194,58 +204,71 @@ fail:
   return ncclInternalError;
 }
 
+/*
+IB 插件对 ncclNet vtable 里 makeVDevice 的实现（外层 ncclIbMakeVDevice 只是套一把 ncclIbMutex 锁再调它）。
+它的职责是把 N 个物理端口聚合成一个"合并/虚拟 NIC"（ncclIbMergedDev），追加进插件的合并设备表。
+这正是 XML 里 speed=400000、name="mlx5_0+mlx5_1" 的 <net> 节点在插件侧的数据来源。
+*/
 ncclResult_t ncclIbMakeVDeviceInternal(int* d, ncclNetVDeviceProps_t* props) {
+  // NCCL_IB_MERGE_NICS 决定是否关闭 NIC 融合，却请求融合多卡，场景 1 的 1:1 基座（ndevs=1）不受此限
   if (ncclParamIbMergeNics() == 0 && props->ndevs > 1) {
     INFO(NCCL_NET, "NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0");
     return ncclInvalidUsage;
   }
 
+  // 空聚合无意义，WARN 报错
   if (props->ndevs == 0) {
     WARN("NET/IB : Can't make virtual NIC with 0 devices");
     return ncclInvalidUsage;
   }
 
+  // 合并表满，硬保护
   if (ncclNMergedIbDevs == MAX_IB_VDEVS) {
     WARN("NET/IB : Cannot allocate any more virtual devices (%d)", MAX_IB_VDEVS);
     return ncclInvalidUsage;
   }
 
   // Always count up number of merged devices
-  ncclIbMergedDev* mDev = ncclIbMergedDevs + ncclNMergedIbDevs;
-  mDev->vProps.ndevs = 0;
-  mDev->speed = 0;
-  mDev->railId = ncclIbDevs[props->devs[0]].railId;
+  ncclIbMergedDev* mDev = ncclIbMergedDevs + ncclNMergedIbDevs;  // 取下一个未用槽（此刻还没 ++）
+  mDev->vProps.ndevs = 0;  // 子设备计数清零，下面逐个填
+  mDev->speed = 0;  // 速度清零，下面累加
+  mDev->railId = ncclIbDevs[props->devs[0]].railId;  // 先用首个子设备的 railId 作初值
   // Set the virtual bit on to avoid collision with physical planes when multiple planes are merged.
-  mDev->planeId = (props->ndevs > 1) ? NCCL_IB_PLANE_VIRT_BIT : ncclIbDevs[props->devs[0]].planeId;
+  mDev->planeId = (props->ndevs > 1) ? NCCL_IB_PLANE_VIRT_BIT : ncclIbDevs[props->devs[0]].planeId;  // 单卡：沿用物理 planeId
 
+  // 逐个子设备累加
   for (int i = 0; i < props->ndevs; i++) {
     ncclIbDev* dev = ncclIbDevs + props->devs[i];
-    if (mDev->vProps.ndevs == NCCL_IB_MAX_DEVS_PER_NIC) return ncclInvalidUsage;
-    mDev->vProps.devs[mDev->vProps.ndevs++] = props->devs[i];
-    mDev->speed += dev->speed;
+    if (mDev->vProps.ndevs == NCCL_IB_MAX_DEVS_PER_NIC) return ncclInvalidUsage;  // 单 vNic 最多 8 个子设备
+    mDev->vProps.devs[mDev->vProps.ndevs++] = props->devs[i];  // 记下子设备索引
+    mDev->speed += dev->speed;  // 速度累加 = 聚合带宽
     // rail ID of a fused device with different rails is undefined.
-    if (dev->railId == NCCL_NET_ID_UNDEF || mDev->railId != dev->railId) mDev->railId = NCCL_NET_ID_UNDEF;
+    if (dev->railId == NCCL_NET_ID_UNDEF || mDev->railId != dev->railId) mDev->railId = NCCL_NET_ID_UNDEF;  // 跨 rail 或无 rail，railId 降级为 UNDEF
     // Only set the bit if multiple devs are merged, otherwise keep the initial value
-    if (props->ndevs > 1) mDev->planeId |= (0x1 << dev->planeIdx);
+    if (props->ndevs > 1) mDev->planeId |= (0x1 << dev->planeIdx);  // 多卡：把各子设备平面位或进去
 
     // Each successive time, copy the name '+' new name
-    if (mDev->vProps.ndevs > 1) {
+    if (mDev->vProps.ndevs > 1) {  // 非首个子设备
       snprintf(mDev->devName + strlen(mDev->devName), sizeof(mDev->devName) - strlen(mDev->devName), "+%s",
-               dev->devName);
+               dev->devName);  // 追加 "+名字"
     // First time, copy the plain name
     } else {
-      strncpy(mDev->devName, dev->devName, MAXNAMESIZE);
+      strncpy(mDev->devName, dev->devName, MAXNAMESIZE);   // 首个：plain name
     }
   }
 
   // Check link layers
   ncclIbDev* dev0 = ncclIbDevs + props->devs[0];
   for (int i = 1; i < props->ndevs; i++) {
-    if (props->devs[i] >= ncclNIbDevs) {
+    if (props->devs[i] >= ncclNIbDevs) {  // 越界保护
       WARN("NET/IB : Cannot use physical device %d, max %d", props->devs[i], ncclNIbDevs);
       return ncclInvalidUsage;
     }
     ncclIbDev* dev = ncclIbDevs + props->devs[i];
+    /*
+    以第一个子设备为基准，要求所有子设备的 link（IBV_LINK_LAYER_INFINIBAND 或 ETHERNET）一致，
+    不能把 IB 卡和 RoCE 卡融在一起。不一致时提示用户用 NCCL_IB_HCA 只选同一链路类型的网卡
+    */
     if (dev->link != dev0->link) {
       WARN("NET/IB : Attempted to merge incompatible devices: [%d]%s:%d/%s and [%d]%s:%d/%s. Try selecting NICs of "
            "only one link type using NCCL_IB_HCA",
@@ -255,7 +278,7 @@ ncclResult_t ncclIbMakeVDeviceInternal(int* d, ncclNetVDeviceProps_t* props) {
     }
   }
 
-  *d = ncclNMergedIbDevs++;
+  *d = ncclNMergedIbDevs++;  // 出参返回新下标，计数自增
   INFO(NCCL_NET, "NET/IB : Made virtual device [%d] name=%s speed=%d ndevs=%d rail=%d plane=%d", *d, mDev->devName,
        mDev->speed, mDev->vProps.ndevs, mDev->railId, mDev->planeId);
   return ncclSuccess;
@@ -502,6 +525,10 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
         snprintf(line + strlen(line), sizeof(line) - strlen(line), ":%d", ncclIbDevs[d].planeId);
       }
       snprintf(line + strlen(line), sizeof(line) - strlen(line), "/%s", NCCL_IB_LLSTR(ncclIbDevs[d].link));
+      /*
+      init 建 1:1 物理基座（ndevs=1），枚举排序后，收尾循环为每个物理端口建一个单设备合并项。
+      于是 init 后 ncclNMergedIbDevs == ncclNIbDevs，上层看到的设备表先是物理端口的 1:1 镜像。
+      */
       // Add this plain physical device to the list of virtual devices (after sorting)
       int vDev;
       ncclNetVDeviceProps_t vProps = {0};

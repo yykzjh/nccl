@@ -39,12 +39,15 @@ static ncclResult_t ncclEnvPluginLoad(void) {
   const char* envName;
   if (envPluginStatus != envPluginLoadReady) goto exit;
 
+  // 从环境变量 NCCL_ENV_PLUGIN 获取插件名称，例如 NCCL_ENV_PLUGIN=gcp，可能是从之前的 NCCL 配置文件导出的该环境变量
   if ((envName = std::getenv("NCCL_ENV_PLUGIN")) != nullptr) {
     INFO(NCCL_ENV, "NCCL_ENV_PLUGIN set by environment to %s", envName);
-    if (strcasecmp(envName, "none") == 0) {
+    // 如果显式设置为 none，则不加载插件
+    if (strcasecmp(envName, "none") == 0) { // 不区分大小写比较字符串是否相等
       goto fail;
     }
   }
+  // 打开环境插件动态库句柄
   envPluginLib = ncclOpenEnvPluginLib(envName);
   if (nullptr == envPluginLib) {
     goto fail;
@@ -52,8 +55,10 @@ static ncclResult_t ncclEnvPluginLoad(void) {
     envName = ncclPluginLibPaths[ncclPluginTypeEnv];
   }
 
+  // 查找 v2 版本的插件符号 ncclEnvPlugin_v2，类型为 ncclEnv_t*
   ncclEnvPlugins[EXT_ENV_PLUGIN] = getNcclEnv_v2(envPluginLib);
   if (ncclEnvPlugins[EXT_ENV_PLUGIN] == nullptr) {
+    // fallback to v1
     ncclEnvPlugins[EXT_ENV_PLUGIN] = getNcclEnv_v1(envPluginLib);
     if (ncclEnvPlugins[EXT_ENV_PLUGIN] == nullptr) {
       INFO(NCCL_INIT, "External env plugin %s is unsupported", envName);
@@ -82,6 +87,7 @@ static ncclResult_t ncclEnvPluginUnload(void) {
     ncclEnvPlugin = ncclEnvPlugins[INT_ENV_PLUGIN];
     ncclEnvPlugins[EXT_ENV_PLUGIN] = nullptr;
   }
+  // 关闭环境插件动态库句柄
   NCCLCHECK(ncclClosePluginLib(envPluginLib, ncclPluginTypeEnv));
   return ncclSuccess;
 }
@@ -91,19 +97,26 @@ void ncclEnvPluginFinalize(void);
 static bool initialized;
 
 ncclResult_t ncclEnvPluginInit(void) {
+  // 先尝试从 NCCL 配置文件解析环境变量到当前进程环境
   initEnv();
+  // 加载环境插件，即 ncclEnv_t* 类型结构体对象
   NCCLCHECK(ncclEnvPluginLoad());
   ncclEnvPlugin =
     (envPluginLoadSuccess == envPluginStatus) ? ncclEnvPlugins[EXT_ENV_PLUGIN] : ncclEnvPlugins[INT_ENV_PLUGIN];
+  // 环境插件初始化
   NCCLCHECK(ncclEnvPlugin->init(NCCL_MAJOR, NCCL_MINOR, NCCL_PATCH, NCCL_SUFFIX, ncclDebugLog));
+  // 注册进程退出时的清理函数
   atexit(ncclEnvPluginFinalize);
+  // 以 release 语义把初始化完成标志发布出去
   COMPILER_ATOMIC_STORE(&initialized, true, std::memory_order_release);
   return ncclSuccess;
 }
 
 void ncclEnvPluginFinalize(void) {
   if (ncclEnvPlugin->finalize) {
+    // 调用插件自己的 finalize()
     ncclEnvPlugin->finalize();
+    // 卸载插件动态库
     ncclEnvPluginUnload();
   }
 }

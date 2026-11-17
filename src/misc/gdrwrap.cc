@@ -12,6 +12,7 @@
 #include "core.h"
 #include "os.h"
 
+// 声明 GDR 动态链接库中用到的函数指针
 /* Function pointers assigned from dynamic library (os layer) */
 static gdr_t (*gdr_internal_open)(void);
 static int (*gdr_internal_close)(gdr_t g);
@@ -41,12 +42,15 @@ std::mutex& getGdrMutex() {
 
 #define LOAD_SYM(handle, symbol, funcptr) \
   do { \
+    // 将函数指针转成无类型的函数指针的指针
     cast = (void**)&funcptr; \
+    // 获取指定符号函数的地址
     tmp = ncclOsDlsym(handle, symbol); \
     if (tmp == NULL) { \
       WARN("ncclOsDlsym failed on %s - %s", symbol, ncclOsDlerror()); \
       goto teardown; \
     } \
+    // 保存
     *cast = tmp; \
   } while (0)
 
@@ -68,12 +72,15 @@ static void initOnceFunc(void) {
   void* tmp;
   void** cast;
 
+  // 库名由平台决定，Linux 上 GDRAPI_LIBNAME 为 libgdrapi.so
+  // 打开动态链接库句柄
   gdrhandle = ncclOsDlopen(GDRAPI_LIBNAME, NCCL_OS_DL_NOW);
   if (!gdrhandle) {
     WARN("Failed to open %s - %s", GDRAPI_LIBNAME, ncclOsDlerror());
     goto teardown;
   }
 
+  // 从 GDR 动态库句柄中解析要用到的 GDRCopy 函数
   /* Load the function pointers from the DL library image */
   LOAD_SYM(gdrhandle, "gdr_open", gdr_internal_open);
   LOAD_SYM(gdrhandle, "gdr_close", gdr_internal_close);

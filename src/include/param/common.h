@@ -19,6 +19,7 @@
 extern "C" {
 #endif
 
+// 定义 flags，即参数的特殊行为
 typedef enum {
   NCCL_PARAM_FLAG_NONE = 0,
   NCCL_PARAM_FLAG_PUBLISHED = 1ULL << 0, // public parameters in NCCL doc
@@ -30,6 +31,7 @@ typedef enum {
                                                 // It will fallback to std::get_env().
 } ncclParamFlag_t;
 
+// 参数类型定义
 // Type IDs for param info. non-integers, non-boolean and non-const-char* is mapped to RAW type.
 typedef enum {
   NCCL_PARAM_TYPE_I8 = 1,
@@ -45,6 +47,7 @@ typedef enum {
   NCCL_PARAM_TYPE_RAW
 } ncclParamTypeId_t;
 
+// 参数信息定义
 // Parameter metadata. All const char* fields must point to string literals.
 typedef struct {
   ncclParamTypeId_t typeId;
@@ -61,6 +64,7 @@ typedef struct {
 #ifdef __cplusplus
 #include <string>
 
+// 公共接口，纯虚类，这样 Registry 和 C API 不需要知道具体模板类型
 struct ncclParamInterface {
   virtual ~ncclParamInterface() = default;
   virtual ncclResult_t getRawData(void* out, int maxLen, int* len) = 0;

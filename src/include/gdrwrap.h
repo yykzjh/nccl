@@ -51,6 +51,8 @@ static inline void wc_store_fence(void) { atomic_thread_fence(memory_order_relea
 #endif
 
 //#define GDR_DIRECT 1
+
+// 编译期指定 GDR_DIRECT 的意思是直接编译链接 GDRCopy 动态库和头文件 gdrapi.h，直接调用 GDRCopy API，但运行时必须有 GDRCopy 库，GDRCopy 从可选依赖更接近变成强依赖
 #ifdef GDR_DIRECT
 // Call the GDR API library code directly rather than via
 // dlopen() wrappers
@@ -128,6 +130,16 @@ typedef enum gdr_pin_flags {
 #define GPU_PAGE_OFFSET  (GPU_PAGE_SIZE-1)
 #define GPU_PAGE_MASK    (~GPU_PAGE_OFFSET)
 
+// 运行时加载 GDRCopy 动态库需要自己定义涉及到的数据类型
+
+/*
+gdr 数据类型是从 GDRCopy gdr_open API 获取的句柄，不是自己创建的，也没有具体用到它，例如：
+  struct gdr obj;
+  sizeof(struct gdr);
+  handle->xxx;
+
+  由 GDRCopy API 完全管理 gdr 类型的生命周期，所以不用显示定义 gdr 结构体的内部字段
+*/
 struct gdr;
 typedef struct gdr *gdr_t;
 
@@ -179,22 +191,28 @@ typedef struct gdr_mem_desc {
   gdr_mh_t gdrMh;
 } gdr_mem_desc_t;
 
+// 头文件里的 static 函数会被 #include 复制到每个源文件中，本质上每个 .cc 文件都有自己的一份私有拷贝
 static gdr_t ncclGdrInit() {
   int libMajor, libMinor, drvMajor, drvMinor;
   gdr_t handle = NULL;
+  // 动态加载 GDRAPI 动态库中需要的函数
   // Dynamically load the GDRAPI library symbols
   if (wrap_gdr_symbols() == ncclSuccess) {
+    // 调用 gdr_internal_open()，即 gdr_open()，返回 GDRCopy driver handle
     handle = wrap_gdr_open();
 
     if (handle != NULL) {
       ncclResult_t res;
 
+      // 查询 libgdrapi.so 的版本
       // Query the version of libgdrapi
       NCCLCHECKGOTO(wrap_gdr_runtime_get_version(&libMajor, &libMinor), res, error);
 
+      // 查询 kernel driver gdrdrv 的版本
       // Query the version of gdrdrv driver
       NCCLCHECKGOTO(wrap_gdr_driver_get_version(handle, &drvMajor, &drvMinor), res, error);
 
+      // 仅支持 libgdrapi >= 2.1 且 gdrdrv >= 2.1
       // Only support GDRAPI 2.1 and later
       if (libMajor < 2 || (libMajor == 2 && libMinor < 1) || drvMajor < 2 || (drvMajor == 2 && drvMinor < 1)) {
         goto error;
@@ -205,6 +223,7 @@ static gdr_t ncclGdrInit() {
   }
   return handle;
 error:
+  // 关闭已经打开的 GDRCopy handle
   if (handle != NULL) (void) wrap_gdr_close(handle);
   return NULL;
 }

@@ -19,6 +19,7 @@
 #include "os.h"
 #include "os_socket_pair.h"
 
+// RAS 的通知类型
 // Type of a notification from a local NCCL thread.
 typedef enum {
   RAS_ADD_RANKS = 0,
@@ -79,58 +80,117 @@ static void rasTerminate();
 
 NCCL_PARAM(RasTimeoutFactor, "RAS_TIMEOUT_FACTOR", 1);
 
+/*
+RAS 把函数按"哪个线程调用它"分成两大类：
+  1. regular NCCL threads，用户调 ncclCommInitRank 等的普通线程调用的 RAS 入口，如 ncclRasCommInit、ncclRasCommFini、ncclRasAddRanks。
+它们是普通 NCCL 流程到 RAS的入口，必须线程安全(多 comm/多线程可能并发调)，且不亲自干 RAS 的重活，而是通过 self-pipe(rasNotificationPipe)把请求投递给 RAS 线程。
+  2. the RAS thread，rasThreadMain 及其调用的 rasLocalHandle、rasLocalHandleAddRanks、overlay 网络维护/健康检查等，是真正干 RAS 活的地方。
+*/
+
 //////////////////////////////////////////////////
 // Functions invoked from regular NCCL threads. //
 //////////////////////////////////////////////////
 
+/*
+每次 comm 初始化都会调它，不是只调一次。但进程级 RAS 子系统只建一次，函数体用 DCLP(双重检查锁定)。
+在所有 RAS 入口里它必须最先调，因为只有它把 rasInitialized 置 true，其它入口依赖这个前提。
+myRank 是 struct rasRankInit*，调用方必须预先把 myRank->addr 填成 bootstrap 网卡的 IP。
+成功返回后，函数把 RAS 网络监听 socket 的端口回写进 myRank->addr。
+*/
 // Invoked by regular NCCL threads on every comm initialization.  This is the first function to call.
 // The myRank structure should be passed with the addr element initialized to the IP address of the bootstrap
 // network interface to use.  On a successful return, the address will be updated with the port number of the
 // RAS network listening socket.
 ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank) {
   ncclResult_t ret = ncclSuccess;
-  if (!rasInitialized) {
+  // 双重检查锁(DCLP)，一个进程中只有第一个 comm 做重活
+  if (!rasInitialized) {  // 外层，快路径，不加锁
     std::lock_guard<std::mutex> lock(rasInitMutex);
-    if (!rasInitialized) {
+    if (!rasInitialized) {  // // 内层，加锁后防止两个线程同时通过外层判定后重复初始化
       union ncclSocketAddress addr;
 
+      // 将 bootstrapNetIfAddr 拷来的 bootstrap 网卡 IP 拷贝到 addr
       memcpy(&addr, &myRank->addr, sizeof(addr));
+      // 端口 htons(0)，bind 到 0 端口，OS 分配临时端口(RAS overlay 用随机端口，区别于客户端口的固定 28028)。
       (addr.sa.sa_family == AF_INET ? addr.sin.sin_port : addr.sin6.sin6_port) = htons(0);
+      /*
+      初始化一个 socket
+        ncclSocketDefaultMagic() 用进程级默认 magic(NCCL_SOCKET_MAGIC，可 env 覆盖)，不是 per-comm magic，
+      因为 RAS 跨所有 comm，同进程/节点的 peer 都是同一套 RAS 协议。
+        abortFlag=nullptr(关键设计)。RAS 不绑定任何 comm 的 abortFlag，因为 RAS 必须在 comm abort/hang 时照常工作去诊断上报，
+      若绑了某 comm 的 abortFlag，abort 那个 comm 就会连带杀掉 RAS，恰好在最需要它的时候失效。RAS 有自己的生命周期
+      (rasInitialized + rasInitRefCount + atexit + 管道的 RAS_TERMINATE 通知)。对比:bootstrap socket 带 abortFlag 求可中止、
+      proxy ipcSock 带 comm->abortFlag，唯独 RAS 故意不带。
+        asyncFlag=1，RAS 网络 socket 非阻塞，由 rasThreadMain 的 reactor poll 循环驱动。
+      RAS 单线程要复用大量 peer 连接 + 集合操作，必须异步。
+      */
       NCCLCHECKGOTO(ncclSocketInit(&rasNetListeningSocket, &addr, ncclSocketDefaultMagic(), ncclSocketTypeRasNetwork,
                                    /*abortFlag*/ nullptr, /*asyncFlag*/ 1),
                     ret, fail);
+      // RAS socket 完成 bind、listen
       NCCLCHECKGOTO(ncclSocketListen(&rasNetListeningSocket), ret, fail);
       INFO(NCCL_RAS, "RAS network listening socket at %s", ncclSocketToString(&rasNetListeningSocket.addr, rasLine));
 
+      /*
+      创建一个本地 28028 监听 socket 给外部 RAS 客户端工具(nccl-ras CLI / nvidia 调试工具)连进来查询 RAS 状态。
+      所以 RAS 有两个监听端，rasNetListeningSocket(随机端口，peer RAS 线程互联的 overlay) 和 rasClientListeningSocket(固定端口，外部工具查询)。
+      返回值被 (void) 丢弃，客户端口建失败(如端口被占)不致命，RAS 核心(overlay 监控)照常。
+      */
       (void)rasClientInitSocket();
 
+      /*
+      self-pipe 唤醒管道(reactor 的跨线程通知)
+      通过 pipe 创建一个管道的读、写端口 fds，保存到 rasNotificationPipe.
+        写端 [1]：普通 NCCL 线程通过 rasLocalNotify(msg) 写入(持 rasNotificationMutex 防多线程交错)。
+      触发者 ncclRasAddRanks(发 RAS_ADD_RANKS)、rasTerminate(发 RAS_TERMINATE)。
+        读端 [0]：RAS 线程在 rasThreadMain 的 poll 里监听，可读时调 rasLocalHandle 读出 msg 并分派
+      (RAS_ADD_RANKS → rasLocalHandleAddRanks;RAS_TERMINATE → *terminate=true)。
+        作用：让单线程 reactor 接收异步跨线程通知而无需轮询/条件变量，通知被统一成"一个可读 fd"融进同一个 poll 循环。
+        顺序关键：管道必须在 rasThread 启动之前建好(线程一上来就 poll [0])。
+      */
       NCCLCHECKGOTO(ncclOsSocketPairCreate(rasNotificationPipe), ret, fail);
 
+      /*
+      启动 RAS 主线程
+      rasThreadMain 是 RAS 的单线程 reactor(poll 一批 rasPfds：网络监听端、客户端监听端、通知管道读端、各 peer 连接)。
+      */
       rasThread = std::thread(rasThreadMain, nullptr);
+      // 线程名 "NCCL RAS" 便于 ps -T/gdb/htop 识别。
       ncclSetThreadName(rasThread, "NCCL RAS");
-
+      // 状态置位
       rasInitialized = true;
-
+      // 进程退出时发 RAS_TERMINATE 并 join 线程，干净收尾
       atexit(rasTerminate);
     }
   }
+
+  // 增加引用计数，每个 comm +1
   ncclAtomicRefCountIncrement(&rasInitRefCount);
 
+  /*
+  在 DCLP 块之外，每个 comm 都执行。ncclComms 是进程内所有 comm 的注册表，带空洞(ncclRasCommFini 把终止的 comm 置 nullptr)。
+  RAS 线程据此监控本进程全部 comm。扩容粒度 RAS_INCREMENT*8 = 32。
+  */
   {
     std::lock_guard<std::mutex> lock(ncclCommsMutex);
 
     int i;
+    // 找空槽(允许空洞)
     for (i = 0; i < nNcclComms; i++) {
       if (ncclComms[i] == nullptr) break;
     }
+    // 没空槽则扩容 +32
     if (i == nNcclComms) {
       NCCLCHECK(ncclRealloc(&ncclComms, nNcclComms, nNcclComms + RAS_INCREMENT * 8));
       nNcclComms += RAS_INCREMENT * 8;
     }
+    // comm 登记
     ncclComms[i] = comm;
+    // 标记需重排(RAS 监控时按序查找)
     ncclCommsSorted = false;
   }
 
+  // 回写实际 RAS 地址(供 allgather)，主要是随机分配的端口号
   if (myRank != nullptr) memcpy(&myRank->addr, &rasNetListeningSocket.addr, sizeof(myRank->addr));
 
 exit:
@@ -169,14 +229,30 @@ static void rasTerminate() {
   if (rasLocalNotify(&msg) == ncclSuccess) rasThread.join();
 }
 
+/*
+ncclRasAddRanks 写完管道就返回，RAS 线程稍后(rasThreadMain 的 poll 轮到管道读端时)才真正读指针、调 rasLocalHandleAddRanks
+*/
 // Invoked by regular NCCL threads on every (non-split) comm initialization.  Provides info on all the ranks within
 // the communicator.
 ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks) {
+  // 创建一个 RAS 消息
   struct rasNotification msg;
   memset(&msg, '\0', sizeof(msg));
   msg.type = RAS_ADD_RANKS;
+  /*
+  这里传入的是 RAS 所有 ranks 的初始化数据指针。所以数组本身必须在移交后继续存活，直到 RAS 线程异步读取处理。
+  为什么"传指针"在这里成立，有三个前提：
+    1. 同进程，过管道的指针仍然有效；
+    2. 为什么不拷贝数组?大小 + 管道原子性
+      ranks 是 nranks × sizeof(rasRankInit),可能上千 rank、几百 KB，塞不进定长小 msg。
+      那条 static_assert(sizeof(struct rasNotification) <= PIPE_BUF) 是设计护栏，保证整个 msg(含指针)≤ PIPE_BUF(4096),
+    于是 write 到管道是原子的，多线程通知不交错、单条通知不被截断。传 8 字节指针正好让 msg 极小、满足原子写，真拷贝大数组就破坏了这个前提。
+    3. 管道提供 happens-before，数组移交前已填好。写管道(rasLocalNotify)→ 读管道(rasLocalHandle)构成同步点。
+  数组在 ringAllInfo 里全部填好之后才由 ncclRasAddRanks 把指针写进管道，RAS 线程读到指针时，数组已是完整数据。
+  */
   msg.addRanks.ranks = ranks;
   msg.addRanks.nranks = nranks;
+  // 把 msg(含指针)写进 rasNotificationPipe[1]
   NCCLCHECK(rasLocalNotify(&msg));
   return ncclSuccess;
 }
@@ -185,12 +261,15 @@ ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks) {
 static ncclResult_t rasLocalNotify(const struct rasNotification* msg) {
   if (!rasInitialized) return ncclSuccess;
 
+  // 在此获取独占锁，以避免多个用户线程之间的多路复用（不确定这是否绝对必要，但这样做也没坏处）
   // Take an exclusive lock here to avoid multiplexing between multiple user threads (not sure if it's
   // strictly required, but it won't hurt)...
   std::lock_guard<std::mutex> lock(rasNotificationMutex);
   size_t done = 0;
+  // 循环写入通知
   while (done < sizeof(*msg)) {
     size_t written;
+    // 异步向管道写端写入一次数据
     NCCLCHECK(ncclOsSocketPairWrite(rasNotificationPipe[1], (char*)msg + done, sizeof(*msg) - done, &written));
     done += written;
   }

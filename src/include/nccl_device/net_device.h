@@ -16,11 +16,11 @@
 #define NCCL_NET_DEVICE_UNPACK_VERSION 0x7
 
 typedef enum {
-  NCCL_NET_DEVICE_HOST = 0,
-  NCCL_NET_DEVICE_UNPACK = 1,
-  NCCL_NET_DEVICE_GIN_PROXY = 2,
-  NCCL_NET_DEVICE_GIN_GDAKI = 3,
-  NCCL_NET_DEVICE_GIN_GPI = 4,
+  NCCL_NET_DEVICE_HOST = 0,  // 不卸载：CPU proxy 驱动网络
+  NCCL_NET_DEVICE_UNPACK = 1,  // 卸载到 GPU：recv 侧数据由 device 直接 unpack 落位
+  NCCL_NET_DEVICE_GIN_PROXY = 2,  // GIN：GPU 发起，CPU proxy 协助推进
+  NCCL_NET_DEVICE_GIN_GDAKI = 3,  // GIN：GPUDirect Async Kernel-Initiated，GPU 直接敲网卡
+  NCCL_NET_DEVICE_GIN_GPI = 4,  // GIN：另一种 GPU 发起后端
 } ncclNetDeviceType;
 
 typedef struct {

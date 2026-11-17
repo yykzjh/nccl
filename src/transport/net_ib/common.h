@@ -42,26 +42,62 @@ enum ncclIbRequestMatchingScheme {
   BY_ID = 1,
 };
 
+// 缓存里的一个条目（一块已注册区间的描述）
 struct ncclIbMr {
+  // 这块已注册区间的起始地址，向下页对齐（data & -pageSize）。用页对齐地址做 key，因为 ibv_reg_mr 本就按页粒度 pin
   uintptr_t addr;
+  // 区间跨多少页（向上取整覆盖 data+size）。和 addr 一起界定区间的 [addr, addr+pages*pageSize) 范围
   size_t pages;
+  // 引用计数，当前有多少个"逻辑注册"复用着这一条 MR。命中一次 +1，反注册一次 -1，归零才真正 ibv_dereg_mr
   int refs;
+  // 真正的 verbs MR 句柄（内含 lkey/rkey）。缓存命中时直接把它当 *mhandle 返回给调用方，省掉整次注册
   ibv_mr* mr;
 };
 
+// 装条目的容器（挂在每块物理设备上）
 struct ncclIbMrCache {
+  // 动态增长的条目数组，按 addr 升序排列（注册时有序插入）。这是缓存主体
   struct ncclIbMr* slots;
+  /*
+  数组已分配容量。满了就几何扩容：capacity < 32 ? 32 : 2*capacity（ncclRealloc）
+  已用条目数（≤ capacity）。遍历、判空的边界
+  */
   int capacity, population;
 };
 
 extern int ncclNMergedIbDevs;
+/*
+MAXNAMESIZE * NCCL_IB_MAX_DEVS_PER_NIC：给每个子设备名留 MAXNAMESIZE 的空间 × 最多子设备数。
++ NCCL_IB_MAX_DEVS_PER_NIC：再为每个子设备之间的 + 分隔符各留一个字符。
+*/
 #define NCCL_IB_MAX_DEVS_PER_NIC NCCL_NET_MAX_DEVS_PER_NIC
 #define MAX_MERGED_DEV_NAME (MAXNAMESIZE * NCCL_IB_MAX_DEVS_PER_NIC) + NCCL_IB_MAX_DEVS_PER_NIC
-struct alignas(64) ncclIbMergedDev {
+// IB 插件里表达"网卡融合（NIC Fusion / 多轨聚合）"的结构，把多块物理网卡在逻辑上捏成一块"虚拟大网卡"，让一次连接能同时用上多块卡的带宽
+struct alignas(64) ncclIbMergedDev {  // 缓存行对齐
+  /*
+  这个虚拟设备聚合了哪些物理设备，核心就两个字段成员：
+    ndevs：聚合了几块物理卡
+    devs[8]：各物理卡在 ncclIbDevs 里的索引数组
+  */
   ncclNetVDeviceProps_t vProps;
+  // 聚合带宽
   int speed;
+  /*
+  轨道 ID（rail-optimized 拓扑），标识这块网卡属于轨道优化网络的哪一条"轨道"。
+  rail-optimized 是数据中心常见布线，把所有节点的"第 k 张网卡"接到同一个交换机平面，
+  形成一条 rail。同 rail 内通信跳数少、更快。
+  融合的子设备若分属不同 rail，合并设备的 railId 就置为 UNDEF。
+  因为它跨了多条轨道，无法再用单一 rail 描述。这个字段影响跨 NIC 策略（crossNic：0 表示不许跨且要求进出 NIC 同 railId）。
+  */
   int16_t railId;
+  /*
+  平面 ID（多平面网络），标识网卡属于多平面网络的哪个平面（plane），会写进拓扑 XML 的 plane 属性。
+    若只聚合一块卡，直接沿用物理设备的 planeId。
+    若聚合多块卡，则打开"虚拟位" NCCL_IB_PLANE_VIRT_BIT，再用位或把每个子设备的 planeIdx 编进去，
+  每一位代表"这个合并设备覆盖了该平面"。
+  */
   int16_t planeId;
+  // 合并设备的名字，把子设备名拼接起来的字符串，比如两块卡融合会叫 mlx5_0+mlx5_1。构建时"每加一个子设备就把 名字 + '+' + 新名字 追加进去"。
   char devName[MAX_MERGED_DEV_NAME]; // Up to NCCL_IB_MAX_DEVS_PER_NIC * name size, and a character for each '+'
 };
 
@@ -76,43 +112,122 @@ enum ncclIbProvider {
 };
 
 extern int ncclNIbDevs;
+// ncclIbDev 是 IB 插件对一块物理网卡（的一个 port）的完整建模，它是真正持有 verbs 运行时对象、能力参数和缓存的地方。
 struct alignas(64) ncclIbDev {
+  // 每设备一把锁，保护下面的 pdRefs/pd 和 mrCache 这些会被多线程并发改的状态。
   std::mutex mutex;
+  // 在 ibverbs 设备列表里的索引（wrap_ibv_get_device_list 返回的第 d 个），构建时 ncclIbDevs[...].device = d
   int device;
+  /*
+  取自 devAttr.sys_image_guid，芯片级唯一标识。一块芯片有多个 PCI function（物理/虚拟）时，
+  靠它区分"是不是同一颗芯片"。会上报为 props->guid 写进拓扑 XML
+  */
   uint64_t guid;
+  // 这块设备上的 IB port 号
   uint8_t portNum;
+  /*
+  链路层类型，取自 portAttr.link_layer，IBV_LINK_LAYER_INFINIBAND（IB）或 IBV_LINK_LAYER_ETHERNET（RoCE）。
+  宏 NCCL_IB_LLSTR 把它渲染成日志里的 "IB"/"RoCE"。
+  */
   uint8_t link;
+  // 端口速率，上报为 props->speed，拓扑层换算成网卡带宽用于建图调优
   int speed;
+  // wrap_ibv_open_device 打开的设备上下文，这块卡上所有 verbs 操作的句柄根。
   ibv_context* context;
+  /*
+  延迟分配、引用计数共享的 Protection Domain。这块卡上第一条连接才真正 alloc_pd，
+  之后同设备的所有连接共用同一个 PD（pdRefs 计数）。PD 是注册 MR、建 QP 的容器，共享它能省资源。
+  */
   int pdRefs;
   ibv_pd* pd;
+  // 设备名（如 mlx5_0）。MAXNAMESIZE = 64 + MAXSUFFIXSIZE(16) = 80。data-direct 设备会加 _dma 后缀
   char devName[MAXNAMESIZE];
+  /*
+  网卡的 PCI 拓扑路径。pciPath 是对外用的指针（可能指向 fullPciPath，data-direct 设备则单独 ncclCalloc 一份）。
+  拓扑层靠它判断"这块 NIC 挂在哪个 PCIe switch / NUMA 下"，是 GPU-NIC 亲和性计算的关键。
+  */
   char fullPciPath[PATH_MAX];
   char* pciPath;
+  /*
+  物理端口偏移，getProperties 里 props->port = ibDev->portNum + ibDev->realPort，两者相加才是对外的最终 port。
+  现代网卡的 verbs 端口号 portNum 几乎恒为 1，哪怕一块物理卡有多个端口/多个 VF，每个端口都被暴露成独立的 PCI function / ibv 设备，各自的 portNum 都是 1。
+  计算逻辑：遍历所有索引比我小的设备，凡是和我属于同一块物理卡的（PCI 路径匹配），计数 +1。得到的就是"我在同卡兄弟里的 0 基序号"。
+  */
   int realPort;
+  // 取自 devAttr.max_qp，这块卡能开的最大 QP 数。上报为 props->maxComms，进而被拓扑当作 maxChannels（每 NIC 可服务的连接上限）
   int maxQp;
+  // 网卡延迟（props->latency，IB 这里默认 0 未设）
   float latency;
+  /*
+  每设备的内存注册缓存，把昂贵的 ibv_reg_mr/dereg_mr 变成查表。slots 按地址升序，命中条件是"新区间 ⊆ 已有区间"就 refs++ 复用，
+  否则新建条目插入（不合并）。构建时初始化为 capacity=0, population=0。它正是 props->regIsGlobal=1 的底层支撑，
+  因为有这个设备级 fast cache，注册句柄（lkey/rkey）能跨 QP、跨 comm 复用，所以 IB 插件的 regMr 是"全局"的（socket 插件没这层缓存故 regIsGlobal=0）。
+  这也是 user buffer registration 零拷贝优化的前提。
+  */
   struct ncclIbMrCache mrCache;
+  /*
+  ADAPTIVE_ROUTING（自适应路由）开关。默认"IB 链路置 1、RoCE 置 0"，可被 NCCL_IB_ADAPTIVE_ROUTING 覆盖。
+  AR 让交换机为数据包动态选路、缓解拥塞。
+  */
   int ar; // ADAPTIVE_ROUTING
+  /*
+  乱序接收队列大小，注释明确 "valid only when ar=1"。来自 mlx5dv 的 ooo_recv_wrs_caps.max_rc。
+  AR 会导致乱序到达，需要 OOO RQ 承接。connect.cc 里若强开 OOO RQ 但 ar==0 会 WARN（AR 是 OOO RQ 的前提）
+  */
   uint32_t oooRqSize;  // valid only when ar=1
+  // 缓存整份 port 属性（link_layer、各种 speed、gid、mtu 等），避免反复查询
   struct ibv_port_attr portAttr;
+  // 目前只有 fatalErrorCount，记录这块设备的致命错误计数，供 resiliency（故障恢复）逻辑判断。
   struct ncclIbStats stats;
+  // DMA-BUF 探测的结果缓存（1 支持 / -1 不支持），存在物理设备上供反复查询
   int dmaBufSupported;
+  /*
+  通过 NCCL_IB_HCA 指定的，例如："mlx5_0:1:0:0,mlx5_1:1:1:0,mlx5_2:1:0:1,mlx5_3:1:1:1"
+  */
+  // 来自用户配置 userIfs[userIfId].rail，否则 -1（NCCL_NET_ID_UNDEF）。轨道优化网络里标识这块卡属于哪条 rail
   int16_t railId;
+  // 来自用户配置 userIfs[userIfId].plane，否则 -1。多平面网络里的平面 ID。
   int16_t planeId;
+  /*
+  由 ncclIbGetPlaneIndex 把原始 planeId 归一化成的紧凑小整数索引（把稀疏的 planeId 映射到 0,1,2...）。
+  它正是合并设备里 mDev->planeId |= (0x1 << dev->planeIdx) 那个位或编码的位移量，所以必须先归一化成小整数，才能当 bit 位用。
+  */
   int16_t planeIdx;
+  /*
+  这块卡是否支持 mlx5 Direct Verbs（wrap_mlx5dv_is_supported → IB_PROVIDER_MLX5）。
+  只有 MLX5 provider 才能用 OOO RQ、data-direct 这些厂商扩展特性。
+  */
   enum ncclIbProvider ibProvider;
+  // 按 provider 存放各自的专有能力（当前只有 mlx5 分支，未来可扩展别的厂商）。这是"用 union 承载 provider 特定能力"的可扩展设计。
   union {
     struct {
+      /*
+      标记这是不是一个 data-direct 设备。data-direct 是 mlx5 的一种模式，物理 NIC 会被暴露两次，一次经 C2C+PCIe 链路，
+      一次经 data-direct 链路，后者名字带 _dma、dataDirect=1。它影响两处：
+        注册走厂商专用路径：wrap_mlx5dv_reg_dmabuf_mr(..., MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT)。
+        getProperties 里 if (ibDev->capsProvider.mlx5.dataDirect) props->forceFlush = 1（收后需强制 flush）。
+      forceFlush 表示"接收后需要显式 flush（iflush）才能保证写进 CUDA 内存的数据对 GPU 可见"。
+      data-direct 的直通写入路径与常规路径的可见性/排序语义不同，需要一次显式 flush 来确保 GPU 侧读到的是最新数据，所以这类设备强制打开它。
+      
+      data-direct 是 NVIDIA/Mellanox 网卡（ConnectX-7 / BlueField-3 及更新）上的一条"网卡直通 GPU 显存"的专用 PCIe 数据路径，
+      让网卡的 DMA 绕过 CPU root complex 和 C2C 跳，直接读写 GPU 显存，降低延迟、节省 C2C 带宽。
+      */
       int dataDirect;
     } mlx5;
   } capsProvider;
 };
 
+/*
+  物理设备 ncclIbDev：一块真实的 IB/RoCE 网卡（或它的一个 port），最多 32 个，ncclNIbDevs 计数
+  合并设备 ncclIbMergedDev：一个逻辑虚拟网卡，内部引用一个或多个物理设备。上层（NCCL 核心）看到的"网卡"其实是这一层的对象，
+getProperties/connect 都以合并设备的索引 dev 为准。
+为什么要合并？现代 GPU 服务器常给一块 GPU 配多张网卡（多轨 rail-optimized 网络）。把通往同一目的地的多张卡融合成一个逻辑设备，
+就能在一条通信连接里并行用满多张卡的带宽（NIC Fusion），而不是每张卡各建各的。MAX_IB_VDEVS = 256 给足了组合空间。
+*/
 #define MAX_IB_DEVS 32
-#define MAX_IB_VDEVS MAX_IB_DEVS * 8
-extern struct ncclIbMergedDev ncclIbMergedDevs[MAX_IB_VDEVS];
-extern struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
+#define MAX_IB_VDEVS MAX_IB_DEVS * 8  // 256
+extern struct ncclIbMergedDev ncclIbMergedDevs[MAX_IB_VDEVS];  // 合并/虚拟设备
+extern struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];  // 物理设备
 extern int ncclIbRelaxedOrderingEnabled;
 
 #define NCCL_IB_LLSTR(ll) \

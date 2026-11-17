@@ -26,54 +26,71 @@ NCCL_PARAM(IpcUseAbstractSocket, "IPC_USE_ABSTRACT_SOCKET", 1);
  * Create a Unix Domain Socket
  */
 ncclResult_t ncclIpcSocketInit(ncclIpcSocket* handle, int rank, uint64_t hash, volatile uint32_t* abortFlag) {
+  // 防御式初始化
   int fd = NCCL_INVALID_SOCKET;
   struct sockaddr_un cliaddr;
   char temp[NCCL_IPC_SOCKNAME_LEN] = "";
-
   if (handle == NULL) {
     return ncclInternalError;
   }
-
   handle->fd = NCCL_INVALID_SOCKET;
   handle->socketName[0] = '\0';
+
+  /*
+  创建 socket
+    AF_UNIX：同机进程间
+    SOCK_DGRAM：无连接数据报，这是设计选择，会合(rendezvous)语义，每次 send 是发往某个命名 peer 的独立数据报，
+  无需 connect/accept，一个 fd 就能收任意对端的数据报。这正好契合 UDS 服务线程模型，ncclProxyServiceUDS 只 poll 一个 ipcSock，
+  fd 就能收所有请求方，而 fd 传递(SCM_RIGHTS)一条数据报就够。若用 SOCK_STREAM 则要 listen/accept、每连接一个 fd 重得多。
+  */
   if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
     WARN("UDS: Socket creation error : %s (%d)", strerror(errno), errno);
     return ncclSystemError;
   }
 
+  // UNIX 地址清零，保证 sun_path 尾部是干净的 \0
   memset(&cliaddr, 0, sizeof(cliaddr));
   cliaddr.sun_family = AF_UNIX;
 
+  // 拼接 rank 和 UDS hash 构造 "/tmp/nccl-socket-<rank>-<hash十六进制>"
   // Create unique name for the socket.
   int len = snprintf(temp, NCCL_IPC_SOCKNAME_LEN, NCCL_IPC_SOCKNAME_STR, rank, hash);
+  // sun_path 是 108 字节，超了就报错
   if (len > (int)(sizeof(cliaddr.sun_path) - 1)) {
     WARN("UDS: Cannot bind provided name to socket. Name too large");
     close(fd);
     return ncclInternalError;
   }
 
+  // NCCL_IPC_USE_ABSTRACT_SOCKET 表示启用抽象命名模式，默认 1 启用
   int useAbstractSocket = ncclParamIpcUseAbstractSocket();
   if (!useAbstractSocket) {
+    // 如果不启用抽象命名模式，而采用默认的 pathname 模式，需要确保没有改路径的文件
     // For regular Unix domain sockets, unlink any existing socket file
     (void)unlink(temp);
   }
 
   TRACE(NCCL_INIT | NCCL_P2P, "UDS: Creating socket %s%s", temp, useAbstractSocket ? " (abstract)" : "");
 
+  // 将命名字符串拷贝到 socket 地址
   strcpy(cliaddr.sun_path, temp);
+  //如果采用抽象命名模式，需要将命名字符串第一个字符改为 \0
   if (useAbstractSocket) {
     cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
   }
+  // bind 该 socket 到指定命名地址
   if (bind(fd, (struct sockaddr*)&cliaddr, sizeof(cliaddr)) < 0) {
     WARN("UDS: Binding to socket %s failed : %s (%d)", temp, strerror(errno), errno);
     close(fd);
     return ncclSystemError;
   }
 
+  // UDS fd 所有权转移
   handle->fd = fd;
   strcpy(handle->socketName, temp);
-
   handle->abortFlag = abortFlag;
+
+  // 如果需要 abort，将 UDS 配置为非阻塞
   // Mark socket as non-blocking
   if (handle->abortFlag) {
     int flags;

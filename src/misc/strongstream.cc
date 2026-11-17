@@ -29,17 +29,43 @@ struct ncclStrongStreamCapture {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+/*
+进程级单链表头，static + 文件作用域 = 整个进程唯一，所有 comm 共享它。
+有一样东西必须按 context 唯一、被该 context 下所有 comm 共享。
+就是每个 context 节点里的那条 launchOrder strong stream。
+链表保证同一 context 无论建多少个 comm，它们拿到的是同一个 ncclCudaContext 节点、同一条 launchOrder。
+*/
 static ncclCudaContext* cxtListHead = nullptr;
+// 保护这张表
 static std::mutex cxtListMutex;
 
+/*
+跨 comm 的启动顺序串行化（防死锁）
+
+问题背景：NCCL 的集合通信 kernel 是互相阻塞的，一个 AllReduce 要所有 rank 的 kernel 都上到 GPU 上跑起来才能推进。
+如果同一进程里有多个 comm 共享同一块 GPU 或同一 context，而它们向 GPU 提交 kernel 的顺序在各进程/各线程间不一致，就可能死锁。
+
+解决办法：让同一 context 下所有 comm 的 kernel 启动都串到同一条 launchOrder strong stream 上。
+每次启动前 Acquire（等待这条流上前一个启动完成的 event），启动后 Release（把 event 记录上去）。
+这样无论哪个 comm、哪个用户 stream 发起，启动都被强制排成一条全局确定的顺序，消除了顺序不一致导致的死锁。
+
+这就解释了为什么台账要按 context 唯一、跨 comm 共享，
+launchOrder 必须是"每个 context 恰好一条、被该 context 下所有 comm 看到的同一条"，串行化才有意义。
+如果每个 comm 各自一条流，就起不到跨 comm 排序的作用了。
+
+（concurrent = capturing 那个细节：CUDA graph capture 场景允许并发访问这条 strong stream，因为图捕获记录的是依赖关系而非即时执行顺序；
+非捕获的即时启动则必须严格串行以保证确定的程序顺序。这正是我们之前聊过的 strong stream 在 live 与 capture 两种形态下的差异。）
+*/
 ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out) {
   ncclResult_t result = ncclSuccess;
   CUcontext hcontext;
+  // 获取当前线程的 context
   CUCHECK(cuCtxGetCurrent(&hcontext));
 
-  std::lock_guard<std::mutex> lock(cxtListMutex);
+  std::lock_guard<std::mutex> lock(cxtListMutex);  // 全表加锁（进程级串行）
   struct ncclCudaContext* p = cxtListHead;
   while (1) {
+    // 走到表尾没找到，新建插入到表头
     if (p == nullptr) {
       p = new ncclCudaContext{};
       p->refCount = 1;
@@ -49,6 +75,7 @@ ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out) {
       NCCLCHECKGOTO(ncclStrongStreamConstruct(&p->launchOrder), result, leave);
       break;
     }
+    // 命中已有 context，引用 +1
     if (p->hcontext == hcontext) {
       p->refCount += 1;
       break;
@@ -56,7 +83,7 @@ ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out) {
     p = p->next;
   }
 leave:
-  *out = p;
+  *out = p;  // 回写 comm->context
   return ncclSuccess;
 }
 
@@ -128,11 +155,14 @@ ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// 初始化 StrongStream
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss) {
+  // 先创建普通非阻塞的 cudaStream_t 用于 live kernels
   CUDACHECK(cudaStreamCreateWithFlags(&ss->liveStream, cudaStreamNonBlocking));
 #if CUDART_VERSION >= 11030
-  ss->everCaptured = false;
-  ss->captureHead = nullptr;
+  ss->everCaptured = false;  // 初始化还没 capture过 graph
+  ss->captureHead = nullptr;  // 初始化 capture graph 的链表，可复用 stream，或者链接新的
+  // 创建不计时的 cudaEvent_t 用于跨 graph 串行执行
   CUDACHECK(cudaEventCreateWithFlags(&ss->serialEvent, cudaEventDisableTiming));
 #endif
   return ncclSuccess;

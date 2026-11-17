@@ -19,8 +19,10 @@ ncclNvmlDeviceInfo ncclNvmlDevices[ncclNvmlMaxDevices];
 ncclNvmlDevicePairInfo ncclNvmlDevicePairs[ncclNvmlMaxDevices][ncclNvmlMaxDevices];
 
 #if NCCL_NVML_DIRECT
+// 如果直接链接 nvml.h 头文件，则创建新的 pfn_<symbol_name> 符号直接静态指向 symbol 函数 
 #define NCCL_NVML_FN(name, rettype, arglist) constexpr rettype(*pfn_##name) arglist = name;
 #else
+// 如果动态加载 nvml 动态库中的符号，则创建新的 pfn_<symbol_name> 符号置为 nullptr
 #define NCCL_NVML_FN(name, rettype, arglist) rettype(*pfn_##name) arglist = nullptr;
 #endif
 
@@ -68,20 +70,42 @@ union nvmlCCInfoInternal {
 };
 } // namespace
 
+/*
+ncclNvmlEnsureInitialized 承担三件事，且保证全进程只做一次：
+  动态加载 NVML 库，把二十多个符号解析成函数指针（弱依赖，缺失不崩）。
+  初始化 NVML 并枚举整机所有 GPU，缓存句柄和 compute capability 到 ncclNvmlDevices[]。
+  预查所有 GPU 两两之间的 P2P 状态，缓存成 N×N 矩阵 ncclNvmlDevicePairs[][]。
+*/
 ncclResult_t ncclNvmlEnsureInitialized() {
+  // 由于 ncclNvmlEnsureInitialized 被每个 NVML 包装函数在每次调用时都执行一遍，线程级无锁快速路径
   // Optimization to avoid repeatedly grabbing the lock when we only want to
   // read from the global tables.
   if (threadInitialized) return initResult;
   threadInitialized = true;
 
-  std::lock_guard<std::mutex> locked(lock);
+  std::lock_guard<std::mutex> locked(lock);  // 加锁
 
+  // 进程级一次性判断
   if (initialized) return initResult;
   initialized = true;
 
+/*
+header 里默认 NCCL_NVML_DIRECT 0，而这个宏决定了整套机制的形态：
+
+默认走动态加载，好处是 libnccl.so 不依赖 NVML 库存在——在没装完整驱动工具链的容器里也能加载，
+只是 NVML 相关功能降级。这就是"弱依赖"。注意 header 里那大段 End of nvml.h 之前的内容，
+就是为了在不 include nvml.h 的情况下自备类型定义。
+*/
 #if !NCCL_NVML_DIRECT
+  /*
+  NCCL_NVML_DIRECT=1 时，pfn_nvmlInit 是 constexpr 常量指针，编译期直接指向真函数，硬链接 libnvidia-ml，
+  header 里的 nvml 声明	#include "nvml.h"；
+  NCCL_NVML_DIRECT=0（默认）时，pfn_nvmlInit 运行时 nullptr，靠 dlsym 填，无链接依赖，
+  header 自带一份 nvml 类型/常量的复刻声明。
+  */
   if (pfn_nvmlInit == nullptr) {
     ncclOsLibraryHandle libhandle;
+    // 打开 NVML 动态库
     ncclResult_t openRes = ncclOsNvmlOpen(&libhandle);
     if (openRes != ncclSuccess) {
       initResult = openRes;
@@ -121,9 +145,15 @@ ncclResult_t ncclNvmlEnsureInitialized() {
       {(void**)&pfn_nvmlSystemGetConfComputeSettings, "nvmlSystemGetConfComputeSettings"}
     };
     for (Symbol sym : symbols) {
-      *sym.ppfn = ncclOsDlsym(libhandle, sym.name);
+      *sym.ppfn = ncclOsDlsym(libhandle, sym.name);  // 失败就留 nullptr，不报错
     }
 
+    /*
+    libhandle 是局部变量，出了作用域就丢了，永远不会 dlclose。这是刻意的——那二十多个 pfn_* 函数指针指向的代码必须一直有效，
+    一旦 dlclose 全部变野指针。末尾那行 coverity[leaked_storage] 是静态分析工具的抑制注解，等于在说"我知道，别报了"。
+    这和之前看过的 NCCL_NVML_FN 之外的另一处，网络插件用 NCCL_NET_PLUGIN_REF_COUNT 预置引用计数永久阻止 dlclose，
+    是同一个思路的两种实现。
+    */
     // Coverity complains that we never dlclose this object, but that's
     // deliberate, since we want the loaded object to remain in memory until
     // the process terminates, so that we can use its code.
@@ -131,12 +161,15 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   }
 #endif
 
+// 同一个功能加载了两个版本的符号，有 _v2 就用 _v2，没有就退回老版。
 #if NCCL_NVML_DIRECT
+  // 直接链接模式下 pfn 是 constexpr 非空常量，写 != nullptr 会被 GCC 警告"永远为真"，所以硬编码 true 绕开
   bool have_v2 = true;
 #else
   // if this compare is done in the NCCL_NVML_DIRECT=1 case then GCC warns about it never being null
   bool have_v2 = pfn_nvmlInit_v2 != nullptr;
 #endif
+  // 初始化 NVML
   nvmlReturn_t res1 = (have_v2 ? pfn_nvmlInit_v2 : pfn_nvmlInit)();
   if (res1 != NVML_SUCCESS) {
     WARN("nvmlInit%s() failed: %s", have_v2 ? "_v2" : "", pfn_nvmlErrorString(res1));
@@ -145,6 +178,7 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   }
 
   unsigned int ndev;
+  // 获取整机 GPU 数
   res1 = (have_v2 ? pfn_nvmlDeviceGetCount_v2 : pfn_nvmlDeviceGetCount)(&ndev);
   if (res1 != NVML_SUCCESS) {
     WARN("nvmlDeviceGetCount%s() failed: %s", have_v2 ? "_v2" : "", pfn_nvmlErrorString(res1));
@@ -153,6 +187,7 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   }
 
   ncclNvmlDeviceCount = int(ndev);
+  // 整机 GPU 数不可能大于 32，静态分配换取零动态内存管理
   if (ncclNvmlMaxDevices < ncclNvmlDeviceCount) {
     WARN("nvmlDeviceGetCount() reported more devices (%d) than the internal maximum (ncclNvmlMaxDevices=%d)",
          ncclNvmlDeviceCount, ncclNvmlMaxDevices);
@@ -161,6 +196,7 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   }
 
   for (int a = 0; a < ncclNvmlDeviceCount; a++) {
+    // 获取指定索引的 NVML 设备句柄
     res1 = pfn_nvmlDeviceGetHandleByIndex(a, &ncclNvmlDevices[a].handle);
     if (res1 != NVML_SUCCESS) {
       WARN("nvmlDeviceGetHandleByIndex(%d) failed: %s", int(a), pfn_nvmlErrorString(res1));
@@ -168,6 +204,7 @@ ncclResult_t ncclNvmlEnsureInitialized() {
       return initResult;
     }
 
+    // 获取指定 NVML 设备句柄的计算能力
     res1 = pfn_nvmlDeviceGetCudaComputeCapability(ncclNvmlDevices[a].handle, &ncclNvmlDevices[a].computeCapabilityMajor,
                                                   &ncclNvmlDevices[a].computeCapabilityMinor);
     if (res1 != NVML_SUCCESS) {
@@ -177,11 +214,13 @@ ncclResult_t ncclNvmlEnsureInitialized() {
     }
   }
 
+  // 两层循环遍历 N×N P2P 状态矩阵
   for (int a = 0; a < ncclNvmlDeviceCount; a++) {
     for (int b = 0; b < ncclNvmlDeviceCount; b++) {
       nvmlDevice_t da = ncclNvmlDevices[a].handle;
       nvmlDevice_t db = ncclNvmlDevices[b].handle;
 
+      // 查询指定两个 NVML 设备间是否支持 P2P 读
       res1 = pfn_nvmlDeviceGetP2PStatus(da, db, NVML_P2P_CAPS_INDEX_READ, &ncclNvmlDevicePairs[a][b].p2pStatusRead);
       if (res1 != NVML_SUCCESS) {
         WARN("nvmlDeviceGetP2PStatus(%d,%d,NVML_P2P_CAPS_INDEX_READ) failed: %s", a, b, pfn_nvmlErrorString(res1));
@@ -189,6 +228,7 @@ ncclResult_t ncclNvmlEnsureInitialized() {
         return initResult;
       }
 
+      // 查询指定两个 NVML 设备间是否支持 P2P 写
       res1 = pfn_nvmlDeviceGetP2PStatus(da, db, NVML_P2P_CAPS_INDEX_WRITE, &ncclNvmlDevicePairs[a][b].p2pStatusWrite);
       if (res1 != NVML_SUCCESS) {
         WARN("nvmlDeviceGetP2PStatus(%d,%d,NVML_P2P_CAPS_INDEX_READ) failed: %s", a, b, pfn_nvmlErrorString(res1));
@@ -224,8 +264,11 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   } while (0)
 
 ncclResult_t ncclNvmlDeviceGetHandleByPciBusId(const char* pciBusId, nvmlDevice_t* device) {
+  // 懒初始化：首次用时才 dlopen libnvml
   NCCLCHECK(ncclNvmlEnsureInitialized());
+  // NVML 调用全局串行化
   std::lock_guard<std::mutex> locked(lock);
+  // 调真正的 NVML 函数指针
   NVMLCHECK(nvmlDeviceGetHandleByPciBusId, pciBusId, device);
   return ncclSuccess;
 }
@@ -237,7 +280,9 @@ ncclResult_t ncclNvmlDeviceGetHandleByIndex(unsigned int index, nvmlDevice_t* de
 }
 
 ncclResult_t ncclNvmlDeviceGetIndex(nvmlDevice_t device, unsigned* index) {
+  // 懒初始化：首次用时才 dlopen libnvml
   NCCLCHECK(ncclNvmlEnsureInitialized());
+  // NCCL 初始化时已经把整机 NVML 设备缓存进 ncclNvmlDevices[]，这里靠句柄相等反查数组下标，就是这块卡的 NVML 索引
   for (int d = 0; d < ncclNvmlDeviceCount; d++) {
     if (ncclNvmlDevices[d].handle == device) {
       *index = d;
@@ -261,10 +306,17 @@ ncclResult_t ncclNvmlDeviceGetNvLinkRemotePciInfo(nvmlDevice_t device, unsigned 
   return ncclSuccess;
 }
 
+// 询某块 GPU 的某条 NVLink 链路是否具备某种能力（如是否支持 P2P、是否支持系统内存访问等）
 ncclResult_t ncclNvmlDeviceGetNvLinkCapability(nvmlDevice_t device, unsigned int link,
                                                nvmlNvLinkCapability_t capability, unsigned int* capResult) {
   NCCLCHECK(ncclNvmlEnsureInitialized());
   std::lock_guard<std::mutex> locked(lock);
+  /*
+  device：NVML 设备句柄
+  link：NVLink 链路编号（0、1、2…，一块 Hopper GPU 最多 18 条）
+  capability：要查询的能力枚举 nvmlNvLinkCapability_t，如 NVML_NVLINK_CAP_P2P_SUPPORTED、NVML_NVLINK_CAP_SYS_MEM_ACCESS 等
+  capResult：出参，返回该能力是否存在（非 0 = 支持）
+  */
   NVMLTRY(nvmlDeviceGetNvLinkCapability, device, link, capability, capResult);
   return ncclSuccess;
 }
@@ -313,7 +365,9 @@ ncclResult_t ncclNvmlDeviceGetFieldValues(nvmlDevice_t device, int valuesCount, 
 ncclResult_t ncclNvmlDeviceGetGpuFabricInfoV(nvmlDevice_t device, nvmlGpuFabricInfoV_t* gpuFabricInfo) {
   NCCLCHECK(ncclNvmlEnsureInitialized());
   std::lock_guard<std::mutex> locked(lock);
+  // NVML 的版本化结构要求调用方先填版本号，NVML 据此知道该按哪个版本的布局填充
   gpuFabricInfo->version = nvmlGpuFabricInfo_v2;
+  // 查询一块 GPU 在机架级 NVLink 系统里的物理位置信息
   NVMLTRY(nvmlDeviceGetGpuFabricInfoV, device, gpuFabricInfo);
   return ncclSuccess;
 }
@@ -321,7 +375,9 @@ ncclResult_t ncclNvmlDeviceGetGpuFabricInfoV(nvmlDevice_t device, nvmlGpuFabricI
 ncclResult_t ncclNvmlDeviceGetPlatformInfo(nvmlDevice_t device, nvmlPlatformInfo_t* platformInfo) {
   NCCLCHECK(ncclNvmlEnsureInitialized());
   std::lock_guard<std::mutex> locked(lock);
+  // 也是必须先填写版本号
   platformInfo->version = nvmlPlatformInfo_v2;
+  // 
   NVMLTRY(nvmlDeviceGetPlatformInfo, device, platformInfo);
   return ncclSuccess;
 }

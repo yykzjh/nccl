@@ -35,6 +35,8 @@ extern getNcclCollNet_t getNcclCollNet_v9;
 extern getNcclCollNet_t getNcclCollNet_v10;
 extern getNcclCollNet_t getNcclCollNet_v11;
 extern getNcclCollNet_t getNcclCollNet_v12;
+
+// 表示 NET 插件被多少 comm 引用的基础计数，设为非 0 决定 NET 插件 .so 不会被释放
 NCCL_PARAM(NetPluginRefCount, "NET_PLUGIN_REF_COUNT", 0);
 #define NCCL_NET_VERSION_COUNT 7
 int ncclNetVersion[NCCL_NET_VERSION_COUNT] = {12, 11, 10, 9, 8, 7, 6};
@@ -71,15 +73,17 @@ typedef struct netPluginLib {
 } netPluginLib_t;
 
 static int pluginCount = 0;
-static netPluginLib_t netPluginLibs[NCCL_NET_MAX_PLUGINS] = {0};
+static netPluginLib_t netPluginLibs[NCCL_NET_MAX_PLUGINS] = {0};  // 最多 16 个插件
 static std::mutex netPluginMutex;
 static std::once_flag initPluginLibsOnceFlag;
 
 static ncclResult_t ncclNetPluginUnload(netPluginLib_t* pluginLib) {
+  // 如果有 .so 动态库 handle 并且 NET 插件的引用计数为 0，则释放 handle
   if ((pluginLib->dlHandle) && ((pluginLib->ncclNetPluginRefCount) == 0)) {
     INFO(NCCL_DESTROY | NCCL_NET, "Unloading plugin %s", pluginLib->name);
     NCCLCHECK(ncclClosePluginLib(pluginLib->dlHandle, ncclPluginTypeNet));
 
+    // 重置字段但是保留名称以重用
     // Reset fields but preserve name, to be reused when reloading
     pluginLib->dlHandle = NULL;
     pluginLib->ncclNet = NULL;
@@ -95,12 +99,16 @@ static ncclResult_t ncclNetPluginUnload(netPluginLib_t* pluginLib) {
 }
 
 static ncclResult_t ncclNetPluginLoad(netPluginLib_t* pluginLib) {
+  // 打开 .so 句柄
   pluginLib->dlHandle = ncclOpenNetPluginLib(pluginLib->name);
 
   if (pluginLib->dlHandle == nullptr) goto fail;
+
+  // 从新到旧遍历所有 NET 插件 ABI 版本
   // load ncclNet
   for (int i = 0; i < NCCL_NET_VERSION_COUNT; i++) {
     pluginLib->ncclNetVer = ncclNetVersion[i];
+    // 通过最新版本的 getNcclNet 函数从 .so handle 中解析出 ncclNet_t 插件对象
     pluginLib->ncclNet = getNcclNet[i](pluginLib->dlHandle);
     if (pluginLib->ncclNet) break;
   }
@@ -137,10 +145,13 @@ fail:
   goto exit;
 }
 
+// 获取指定索引的 NET 设备属性
 ncclResult_t ncclNetCheckDeviceVersion(struct ncclComm* comm, ncclNet_t* net, int dev) {
   ncclNetProperties_t props;
 
+  // 获取指定 NET 设备属性
   NCCLCHECK(net->getProperties(dev, &props));
+  // 网络卸载类型
   ncclNetDeviceType type = props.netDeviceType;
   switch (type) {
   case NCCL_NET_DEVICE_HOST:
@@ -154,7 +165,7 @@ ncclResult_t ncclNetCheckDeviceVersion(struct ncclComm* comm, ncclNet_t* net, in
            props.netDeviceVersion, NCCL_NET_DEVICE_UNPACK_VERSION);
       return ncclInternalError;
     }
-  default:
+  default:  // NET 插件不支持 GIN 相关卸载类型，GIN 是另一个子系统，契约违规报错
     WARN("Unknown device code index %d", type);
     return ncclInternalError;
   }
@@ -165,25 +176,40 @@ ncclResult_t ncclNetCheckDeviceVersion(struct ncclComm* comm, ncclNet_t* net, in
 static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* pluginLib) {
   int ndev;
   bool initCompleted = false;
+  // netContext 是每个 comm 独立的，所以哪怕插件已被别的 comm 启用，新 comm 仍要再 init() 一次拿到自己的 context
   // Init must be called for each new comm to set the right context
   if (pluginLib->ncclNetPluginState >= ncclNetPluginStateInitReady && pluginLib->ncclNet) {
     ncclNetCommConfig_t commConfig = {};
+    // 如果未定义就是 -1，否则采用 comm->config.trafficClass 指定值
     commConfig.trafficClass =
       comm->config.trafficClass == NCCL_CONFIG_UNDEF_INT ? NCCL_NET_TRAFFIC_CLASS_UNDEF : comm->config.trafficClass;
+    /*
+    调用 NET 插件的初始化接口：
+      &comm->netContext:输出参数,插件把它的每-comm 上下文句柄写这里,后续 listen/connect/isend/irecv 都靠它;
+      comm->commHash:64 位 communicator 标识;
+      &commConfig:上面的 trafficClass 配置;
+      ncclDebugLog:让插件复用 NCCL 的日志系统;
+      ncclProfilerCallback:让插件能向 NCCL profiler 发事件。
+    */
     if (pluginLib->ncclNet->init(&comm->netContext, comm->commHash, &commConfig, ncclDebugLog, ncclProfilerCallback) !=
         ncclSuccess) {
       goto fail;
     }
     initCompleted = true;
   }
+  // 设备数是硬件/插件属性,与具体 comm 无关,第一个 comm 探测一次缓存下来即可,避免每个 comm 重复探测
   // Detection of the devices is only done when the plugin is being initialized the first time
   if (pluginLib->ncclNetPluginState == ncclNetPluginStateInitReady && pluginLib->ncclNet) {
+    // 获取物理网卡数
     if (pluginLib->ncclNet->devices(&ndev) != ncclSuccess || ndev <= 0) goto fail;
+    // 这两个值后面被 ncclNetGetDevCount 读取,用于拓扑探测(ncclTopoGetSystem)
     pluginLib->netPhysDevs = ndev;
-    pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
+    pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;  // -1，表示虚拟设备数还没定(后续 makeVDevice / ncclNetSetVirtDevCount 再填)
   }
-  pluginLib->ncclNetPluginState = ncclNetPluginStateEnabled;
+  pluginLib->ncclNetPluginState = ncclNetPluginStateEnabled;  // NET 插件 Enabled
   INFO(NCCL_INIT | NCCL_NET, "Initialized NET plugin %s", pluginLib->ncclNet->name);
+
+  // COLL 插件进行与 NET 插件相同初始化流程
 
   // Init must be called for each new comm to set the right context
   if (pluginLib->ncclCollNetPluginState >= ncclNetPluginStateInitReady && pluginLib->ncclCollNet) {
@@ -217,8 +243,10 @@ fail:
 static ncclResult_t ncclNetPluginAssignToComm(struct ncclComm* comm, int pluginIndex, bool* isAssigned) {
   *isAssigned = false;
 
+  // 选第一个 NET 设备检查网络卸载类型是否正常
   if (ncclSuccess != ncclNetCheckDeviceVersion(comm, netPluginLibs[pluginIndex].ncclNet, 0)) return ncclSuccess;
 
+  // 将 NET 相关内容保存到 comm 中，引用计数 +1
   if (netPluginLibs[pluginIndex].ncclNetPluginState >= ncclNetPluginStateEnabled) {
     comm->ncclNet = netPluginLibs[pluginIndex].ncclNet;
     comm->ncclNetVer = netPluginLibs[pluginIndex].ncclNetVer;
@@ -234,6 +262,7 @@ static ncclResult_t ncclNetPluginAssignToComm(struct ncclComm* comm, int pluginI
 }
 
 static ncclResult_t ncclNetPluginDisableOtherExternal(int pluginIndex) {
+  // 只有启用外部插件才禁用其他插件
   // Only if an external plugin is enabled, disable other external plugins
   if (pluginIndex >= (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS)) return ncclSuccess;
   char names[MAX_STR_LEN * (NCCL_NET_MAX_PLUGINS - NCCL_NET_NUM_INTERNAL_PLUGINS)] = {0};
@@ -260,14 +289,16 @@ static void initPluginLibsOnceFunc() {
   int pluginCounter = 0;
 
   memset(netPluginLibs, 0, NCCL_NET_MAX_PLUGINS * sizeof(netPluginLib_t));
-  envNetPlugin = ncclGetEnv("NCCL_NET_PLUGIN");
+  envNetPlugin = ncclGetEnv("NCCL_NET_PLUGIN");  // 获取 NET 插件名称或路径
   if (envNetPlugin) {
     INFO(NCCL_ENV | NCCL_NET, "NCCL_NET_PLUGIN set by environment to %s", envNetPlugin);
-    if (strcasecmp(envNetPlugin, "none") == 0) envNetPlugin = "";
+    if (strcasecmp(envNetPlugin, "none") == 0) envNetPlugin = "";  // 如果指定 None 就是不用插件
     envNetPluginList = strdup(envNetPlugin);
+    // 分割多个插件列表：gcp,efa,accl
     // Iterate over list until the list is empty
     netPluginName = strtok_r(envNetPluginList, ",", &savePtr);
     while (netPluginName) {
+      // 有 ib 和 socket 两个内部插件，所以最多能指定 16 - 2 = 14 个外部插件列表
       // We have 2 internal plugins (ib and socket)
       // So, we can have at most( NCCL_NET_MAX_PLUGINS - (NCCL_NET_NUM_INTERNAL_PLUGINS)) in the NCCL_NET_PLUGIN list
       if (pluginCounter >= (NCCL_NET_MAX_PLUGINS - (NCCL_NET_NUM_INTERNAL_PLUGINS))) {
@@ -276,7 +307,8 @@ static void initPluginLibsOnceFunc() {
         break;
       }
       // need to leave space for the name + "\n"
-      if ((strlen(netPluginName) + 1) <= MAX_STR_LEN) {
+      if ((strlen(netPluginName) + 1) <= MAX_STR_LEN) {  // 长度限制 255
+        // 初始化当前插件 slot 的状态
         netPluginLibs[pluginCounter].ncclNetPluginState = ncclNetPluginStateLoadReady;
         netPluginLibs[pluginCounter].ncclNetPluginRefCount = ncclParamNetPluginRefCount();
         strcpy(netPluginLibs[pluginCounter].name, netPluginName);
@@ -290,12 +322,14 @@ static void initPluginLibsOnceFunc() {
     }
     if (envNetPluginList) free(envNetPluginList);
   } else {
+    // 没有参数指定外部插件，使用默认外部插件名：libnccl-net.so
     // Add default net plugin
     netPluginLibs[pluginCounter].ncclNetPluginState = ncclNetPluginStateLoadReady;
     netPluginLibs[pluginCounter].ncclNetPluginRefCount = ncclParamNetPluginRefCount();
     strcpy(netPluginLibs[pluginCounter++].name, defaultNetPlugin);
   }
 
+  // 添加两个内部插件 slots
   // Add 2 internal ib and socket plugins
   netPluginLibs[pluginCounter].ncclNet = &ncclNetIb;
   netPluginLibs[pluginCounter].ncclNetPluginState = ncclNetPluginStateInitReady;
@@ -306,12 +340,15 @@ static void initPluginLibsOnceFunc() {
 }
 
 static ncclResult_t ncclNetPluginFinalize(struct ncclComm* comm, int pluginIndex) {
+  // NET 插件内部销毁
   NCCLCHECK(netPluginLibs[pluginIndex].ncclNet->finalize(comm->netContext));
+  // CollNet 插件内部销毁
   if (netPluginLibs[pluginIndex].ncclCollNet &&
       netPluginLibs[pluginIndex].ncclCollNetPluginState == ncclNetPluginStateEnabled) {
     NCCLCHECK(netPluginLibs[pluginIndex].ncclCollNet->finalize(comm->collNetContext));
   }
   netPluginLibs[pluginIndex].ncclNetPluginRefCount--;
+  // 外部 NET 插件尝试释放 handle 并重置字段
   if (pluginIndex < (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS)) {
     NCCLCHECK(ncclNetPluginUnload(&netPluginLibs[pluginIndex]));
   }
@@ -320,21 +357,28 @@ static ncclResult_t ncclNetPluginFinalize(struct ncclComm* comm, int pluginIndex
 
 ncclResult_t ncclNetInit(struct ncclComm* comm) {
   bool ncclNetPluginInitialized = false;
+  // 初始化 NET 插件状态，此时还没有打开 .so 和插件对象，准备好 Load
   std::call_once(initPluginLibsOnceFlag, initPluginLibsOnceFunc);
+  // 加锁
   std::lock_guard<std::mutex> lock(netPluginMutex);
   for (int pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++) {
+    // 外部插件并且状态正常，加载插件
     if ((pluginIndex < (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS)) &&
         (netPluginLibs[pluginIndex].ncclNetPluginState == ncclNetPluginStateLoadReady)) {
+      // 加载 .so handle 和 ncclNet_t 插件对象，准备好 Init
       NCCLCHECK(ncclNetPluginLoad(&netPluginLibs[pluginIndex]));
     }
+    // comm->config.netName 可以限定 NET 插件名
     if ((netPluginLibs[pluginIndex].ncclNetPluginState >= ncclNetPluginStateInitReady) &&
         (!comm->config.netName || (strcasecmp(comm->config.netName, netPluginLibs[pluginIndex].ncclNet->name) == 0))) {
+      // 初始化 NET 插件，状态为 Enabled
       // plugin init must be done by all comms to setup the context, therefore we use ">="
       NCCLCHECK(ncclNetPluginInit(comm, &netPluginLibs[pluginIndex]));
       if (netPluginLibs[pluginIndex].ncclNetPluginState == ncclNetPluginStateEnabled) {
         bool isAssigned = false;
         NCCLCHECK(ncclNetPluginAssignToComm(comm, pluginIndex, &isAssigned));
         if (isAssigned) {
+          // 一个外部插件成功赋予给 comm。disable 其他所有插件。
           // If one external plugin is assigned to a comm, then disable all other external plugins
           ncclNetPluginDisableOtherExternal(pluginIndex);
           ncclNetPluginInitialized = true;
@@ -423,11 +467,12 @@ fail:
 
 ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport) {
   constexpr int GPU_BUF_SIZE = 2 * 1024 * 1024;
-#if CUDART_VERSION >= 11030
+  // 新驱动直接查属性(CUDA ≥ 11.3)
+#if CUDART_VERSION >= 11030  // 编译期 NCCL 构建用的 CUDA 版本
   // In CUDA 11.3 and later we can now query the cudaDevAttrGPUDirectRDMASupported attribute
   int driverVersion;
   CUDACHECK(cudaDriverGetVersion(&driverVersion));
-  if (driverVersion >= 11030) {
+  if (driverVersion >= 11030) {  // 运行期实际装的驱动版本
     int cudaDev, attr = 0;
     CUDACHECK(cudaGetDevice(&cudaDev));
     CUDACHECK(cudaDeviceGetAttribute(&attr, cudaDevAttrGPUDirectRDMASupported, cudaDev));
@@ -435,16 +480,21 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport) {
     return ncclSuccess;
   }
 #endif
+  // 老驱动"经验实测"(真的去注册一次 GPU 显存)
+  // static 数组跨调用持久、进程内共享,最多 32 块 GPU
   static int gdrSupportMatrix[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  // 只有第一次(-1)才跑昂贵的实测，之后直接返回缓存的 0/1
   if (gdrSupportMatrix[comm->cudaDev] == -1) {
     int netDevs;
     NCCLCHECK(comm->ncclNet->devices(&netDevs));
     gdrSupportMatrix[comm->cudaDev] = 0;
+    // 遍历网卡，过滤出"能注册 CUDA 指针"的
     for (int dev = 0; dev < netDevs; dev++) {
       // Find a net device which is GDR-capable
       ncclNetProperties_t props;
       NCCLCHECK(comm->ncclNet->getProperties(dev, &props));
+      // 判断是否支持 GDR
       if ((props.ptrSupport & NCCL_PTR_CUDA) == 0) continue;
 
       // Allocate memory on the GPU and try to register it on the NIC.
@@ -453,10 +503,12 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport) {
       char* gpuPtr = NULL;
       void* mHandle = NULL;
       ncclResult_t ret;
+      // 在同一块网卡上 listen 出一个监听端 lComm,
       NCCLCHECKGOTONOWARN(comm->ncclNet->listen(comm->netContext, dev, &handle, &lComm), ret, cleanup1, NCCL_NET);
 
       bool connected;
       connected = false;
+      // while 循环应对 connect/accept 的异步性(未就绪时 comm 为 NULL 就重试),并带 abortFlag 检查以便中止时跳出
       while (!connected) {
         // If we're aborting now, skip to cleanup
         if (COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire)) {
@@ -464,22 +516,29 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport) {
         }
 
         if (sComm == NULL) {
+          // connect 到自己的 handle 得到发送端 sComm
           NCCLCHECKGOTONOWARN(comm->ncclNet->connect(comm->netContext, dev, &handle, &sComm, NULL), ret, cleanup2,
                               NCCL_NET);
         }
-
+        // accept 得到接收端 rComm
         if (rComm == NULL) NCCLCHECKGOTONOWARN(comm->ncclNet->accept(lComm, &rComm, NULL), ret, cleanup2, NCCL_NET);
 
         connected = (rComm != NULL) && (sComm != NULL);
       }
 
+      // 分配 2MB GPU buffer
       NCCLCHECKGOTONOWARN(ncclCudaMalloc(&gpuPtr, GPU_BUF_SIZE, comm->memManager), ret, cleanup2, NCCL_NET);
+      /*
+      发送端注册 GPU 显存。regMr 必须挂在一个 comm(send 或 recv)上，要验证收、发两个方向都能注册 GPU 显存，
+      就需要一对连通的 comm。让网卡 listen + connect 到自己 + accept，就地造出 sComm/rComm 一对，是不依赖任何远端 rank 的最省事自测法。
+      */
       NOWARN(ret = comm->ncclNet->regMr(sComm, gpuPtr, GPU_BUF_SIZE, NCCL_PTR_CUDA, &mHandle), NCCL_NET);
       if (ret == ncclSuccess) {
-        NCCLCHECKNOWARN(comm->ncclNet->deregMr(sComm, mHandle), NCCL_NET);
+        NCCLCHECKNOWARN(comm->ncclNet->deregMr(sComm, mHandle), NCCL_NET);  // 注销
+        // 接受端也试试
         NCCLCHECKNOWARN(comm->ncclNet->regMr(rComm, gpuPtr, GPU_BUF_SIZE, NCCL_PTR_CUDA, &mHandle), NCCL_NET);
         NCCLCHECKNOWARN(comm->ncclNet->deregMr(rComm, mHandle), NCCL_NET);
-        gdrSupportMatrix[comm->cudaDev] = 1;
+        gdrSupportMatrix[comm->cudaDev] = 1;  // 收发都支持注册 GPU 显存，GDR 可用
       }
       NCCLCHECK(ncclCudaFree(gpuPtr, comm->memManager));
     cleanup2:

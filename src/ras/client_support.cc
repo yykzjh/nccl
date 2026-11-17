@@ -164,21 +164,32 @@ static void jsonWriteFooter(double collectionTime, int timeoutsCount);
 // Creates a listening socket for clients to connect to.
 ncclResult_t rasClientInitSocket() {
   ncclResult_t ret = ncclSuccess;
+  // 默认 28028 端口
   const char* clientAddr = "localhost:" STR(NCCL_RAS_CLIENT_PORT);
   union ncclSocketAddress addr;
   const int opt = 1;
+  // addr 可被 NCCL_RAS_ADDR 覆盖
   if (const char* env = ncclGetEnv("NCCL_RAS_ADDR")) clientAddr = env;
+  // 地址字符串解析为 ncclSocketAddress 格式 
   NCCLCHECKGOTO(ncclSocketGetAddrFromString(&addr, clientAddr), ret, fail);
+  // 创建一个 socket
   SYSCHECKGOTO(rasClientListeningSocket = socket(addr.sa.sa_family, SOCK_STREAM, 0), "socket", ret, fail);
+  // 解决 TIME_WAIT 残留地址的复用(进程重启后端口立即可再 bind)
   SYSCHECKGOTO(setsockopt(rasClientListeningSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)), "setsockopt", ret,
                fail);
+/*
+  设置可重用地址和端口，在一个机器节点多个进程的场景，每个进程都会分别创建客户端 socket，
+  此时同节点的多个进程可以同时 bind 28028，内核在它们之间负载均衡 accept。
+*/
 #if defined(SO_REUSEPORT)
   SYSCHECKGOTO(setsockopt(rasClientListeningSocket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)), "setsockopt", ret,
                fail);
 #endif
+  // 默认 bind 到 localhost:28028
   SYSCHECKGOTO(bind(rasClientListeningSocket, &addr.sa,
                     (addr.sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6))),
                "bind", ret, fail);
+  // socket 监听外部 RAS 客户端工具(nccl-ras CLI / nvidia 调试工具)连进来查询 RAS 状态
   SYSCHECKGOTO(listen(rasClientListeningSocket, 16384), "listen", ret, fail);
   INFO(NCCL_INIT | NCCL_RAS, "RAS client listening socket at %s", ncclSocketToString(&addr, rasLine));
 exit:

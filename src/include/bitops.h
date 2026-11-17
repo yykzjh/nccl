@@ -50,7 +50,7 @@ constexpr static __host__ __device__ Int maxval(Int a, Int b, More... more) {
 #define BIT(x) (1UL << (x))
 #define MASK(x) ((1UL << x) - 1UL)
 
-#define DIVUP(x, y) (((x) + (y) - 1) / (y))
+#define  DIVUP(x, y) (((x) + (y) - 1) / (y))
 
 #define ROUNDUP(x, y) (DIVUP((x), (y)) * (y))
 

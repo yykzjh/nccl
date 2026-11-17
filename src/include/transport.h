@@ -41,27 +41,33 @@ int64_t ncclParamMultiSegmentRegister();
 extern int64_t ncclParamNvlsEnable();
 
 struct ncclPeerInfo {
+  // 逻辑 rank 号、CUDA 设备号、NVML 设备号，直接从 comm 拷贝
   int rank;
   int cudaDev;
   int nvmlDev;
-  int gdrSupport;
-  uint64_t hostHash;
-  uint64_t pidHash;
-  dev_t shmDev;
+  int gdrSupport;  // GPUDirect RDMA 支持
+  uint64_t hostHash;  // getHostHash() + commHash，+commHash 隔离不同 job
+  uint64_t pidHash;  // getPidHash() + commHash
+  dev_t shmDev;  // /dev/shm 的设备号，判容器内能否用 SHM 通信
+  // PCI 总线号、GPU 全局唯一 UUID（判"多 rank 抢同一 GPU"用）
   int64_t busId;
   cudaUUID_t gpuUuid;
-  struct ncclComm* comm;
-  int cudaCompCap;
-  size_t totalGlobalMem;
+  struct ncclComm* comm;  // comm 本身
+  int cudaCompCap;  // SM 架构版本，同时初始化 minCompCap=maxCompCap
+  size_t totalGlobalMem;  // 显存容量（向上取整到 2³² 粒度，ROUNDUP 到 4G）
   // MNNVL support
-  nvmlGpuFabricInfoV_t fabricInfo;
-  int cuMemSupport;
-  int version;
-  ncclGinType_t supportedGinType;
-  bool crossNicSupport;
-  bool rmaPluginAvailable;
-  bool cuMemGdrSupport;
-  int mloPart; // MLOPart partition index, or -1 if not an MLOPart GPU
+  nvmlGpuFabricInfoV_t fabricInfo;  // MNNVL 域信息（clusterUuid/cliqueId/state）
+  int cuMemSupport;  //	是否支持 CUDA VMM
+  int version;  // 编译期版本码，用于全员版本一致性校验
+  ncclGinType_t supportedGinType;  // GIN 后端类型
+  bool crossNicSupport;  // 是否允许跨 NIC 收发
+  bool rmaPluginAvailable;  // RMA 插件是否就绪
+  bool cuMemGdrSupport;  // VMM 下能否 GDR
+  /*
+  MLOPart 分区号，非分区 GPU 为 -1，一个从 0 开始的小整数(分区索引)。
+  每块物理 GPU 最多 2 个分区(NCCL_TOPO_MLOPART_DEV_MAX = 2)。
+  */
+  int mloPart;
 };
 
 #define CONNECT_SIZE 256

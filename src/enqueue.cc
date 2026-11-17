@@ -30,21 +30,36 @@ NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 NCCL_PARAM(AllgathervEnable, "ALLGATHERV_ENABLE", 1);
 NCCL_PARAM(SymCeThreshold, "SYM_CE_THRESHOLD", 8 * 1024 * 1024);
 
+// NCCL 初始化阶段为当前 GPU 上所有 collective kernel 做 shared memory opt-in、驱动版本过滤和栈大小统计 的函数。
+// 它决定了后续 kernel launch 时能申请多少动态 shared memory。
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
 
   if (maxStackSize) *maxStackSize = 0;
+  // 环境变量 NCCL_L1_SHARED_MEMORY_CARVEOUT
+  // 可设一个 0–100 的值，表示 L1 cache 与 shared memory 的偏好比例（cudaFuncAttributePreferredSharedMemoryCarveout）
   int carveout = ncclParamL1SharedMemoryCarveout();
+  // 普通 kernel 可用的动态 shared memory 上界，最终会是所有普通 kernel 中 dynSmem 的最小值，因为普通 kernel 全用同一套 launch 配置
   int maxDynamicSmem = 1 << 30;
+  // 用于过滤某些 kernel 对驱动的最低要求
   int driverVersion;
   NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
 
+  // 遍历两类 kernel 表
   for (int sym = 0; sym <= 1; sym++) {
+    /*
+    sym	   表	                       说明
+    0      ncclDevKernelList	       普通 collective kernels，由 src/device/generate.py 生成
+    1	     ncclSymkKernelList	       symmetric memory 专用 kernels，由 src/device/symmetric/generate.py 生成
+    krequires[] 记录每个 kernel 所需的最低 CUDA driver 版本。
+    */
     int kcount = sym == 0 ? ncclDevKernelCount : ncclSymkKernelCount;
     void** kptrs = sym == 0 ? ncclDevKernelList : ncclSymkKernelList;
     int* krequires = sym == 0 ? ncclDevKernelRequirements : ncclSymkKernelRequirements;
     for (int k = 0; k < kcount; k++) {
+      // 驱动版本过滤，如果当前驱动太老，就把该 kernel 指针置 nullptr，相当于禁用该 kernel
+      // 这是 graceful degradation：新 kernel 需要新 driver，老 driver 上自动跳过。
       if (kptrs[k] != nullptr && driverVersion < krequires[k]) {
         INFO(NCCL_INIT, "Skipping %skernel %d which requires driver %d", sym ? "symmetric " : "", k, krequires[k]);
         kptrs[k] = nullptr;
@@ -53,30 +68,46 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
       cudaFuncAttributes attr = {0};
       if (fn == nullptr) continue;
 
+      /*
+      cudaFuncGetAttributes 读取 kernel 元数据，关键用到：
+        attr.sharedSizeBytes：kernel 内静态 __shared__ 变量占用的字节数。
+        attr.localSizeBytes：每个 thread 的 local memory(stack) 字节数。
+      */
       if (!CUDASUCCESS(cudaFuncGetAttributes(&attr, fn))) continue; // Silently ignore failures
 
+      // localSizeBytes 取最大，最后用来设置 cudaLimitStackSize，避免加载 module 时动态重分配 stack（注释提到参考 NVSHMEM issue）
       if (maxStackSize) {
         if (attr.localSizeBytes > *maxStackSize) *maxStackSize = attr.localSizeBytes;
       }
       if (carveout) {
+        /*
+        cudaFuncAttributePreferredSharedMemoryCarveout 是 CUDA 给的一个 hint：0 表示全给 L1，100 表示全给 shared memory。
+        NCCL 默认 NCCL_L1_SHARED_MEMORY_CARVEOUT=0，所以通常不走这分。
+        */
         CUDACHECKGOTO(cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, carveout), result,
                       ignore1);
       ignore1:;
       }
       {
+        // 设备上限 - 该 kernel 静态 shared mem = 该 kernel 还能申请的动态 shared memory 上限
         int dynSmem = maxSharedMem - attr.sharedSizeBytes;
-        if (sym) {
+        if (sym) {  // 对称 kernels：每个 kernel 单独记录
           ncclSymkKernelMaxDynamicSmem[k] = dynSmem;
-        } else {
+        } else {  // 普通 kernels：取所有 kernel 中的最小值
           maxDynamicSmem = std::min(maxDynamicSmem, dynSmem);
         }
+        // 向 CUDA runtime 声明“本 kernel 最多可能使用 dynSmem 字节动态 shared memory”
         CUDACHECKGOTO(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, dynSmem), result,
                       next_kernel);
       }
     next_kernel:;
     }
   }
-
+  /*
+  ncclShmemDynamicSize(cudaArch) 是 NCCL 运行时实际想申请的动态 shared memory 大小
+  它由“每个 warp 的 scratch 大小 × warp 数”决定，随架构变化（Hopper 上 NVLS 路径会更大）
+  如果 NCCL 自己算出来的需求比“所有普通 kernel 能 opt-in 到的最小值”还大，说明当前设备/驱动/编译配置无法支撑，直接报错 ncclSystemError.
+  */
   if (ncclShmemDynamicSize(cudaArch) > maxDynamicSmem) {
     WARN("cudaArch %d dynamic smem %d exceeds device/fn maxSharedMem %d", cudaArch, ncclShmemDynamicSize(cudaArch),
          maxDynamicSmem);

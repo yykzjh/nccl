@@ -55,6 +55,8 @@ struct ncclParam : public ncclParamInterface {
   const T defaultValue;
 
   T value;
+
+  // 如果参数类型 T 不是 const char*，cstrData 也会添加 24B 的 std::string 开销到 ncclParam 中。权衡不采用复杂的模板特化
   // cstrData adds 24B overhead to ncclParam for non-const-char* parameters.
   // This is a trade-off for not using complex template stuff.
   std::string cstrData{};
@@ -75,6 +77,7 @@ struct ncclParam : public ncclParamInterface {
     if (!this->parser) {
       this->parser = ncclParamDefault<T>();
     }
+    // 构造函数中添加参数到注册表
     ncclParamRegistry::add(info.key, info, this);
   }
 
@@ -82,6 +85,7 @@ struct ncclParam : public ncclParamInterface {
   ncclParam& operator=(const ncclParam&) = delete;
   ncclParam& operator=(ncclParam&&) = delete;
 
+  // 通过类似函数调用的方式获取参数值，const char * 类型在下面有特化，返回的就是参数类型
   // Main access function for parameter value through function call-like interface
   // This handles non-const-char* types, for const char *, see specializations below
   T operator()() {
@@ -89,6 +93,7 @@ struct ncclParam : public ncclParamInterface {
     return value;
   }
 
+  // 返回的无类型参数值
   // C API accessor of raw parameter value
   ncclResult_t getRawData(void* out, int maxLen, int* len) override {
     if (!out || !len || maxLen <= 0) return ncclInvalidArgument;
@@ -102,11 +107,13 @@ struct ncclParam : public ncclParamInterface {
     return ncclSuccess;
   }
 
+  // 返回字符串形式的参数值
   std::string toString() override {
     auto lock = ensureLoaded();
     return parser.toString(value);
   }
 
+  // 返回参数的详细信息
   std::string dump() override {
     std::string currentStr = this->toString();
     std::string defaultStr = parser.toString(defaultValue);
@@ -128,20 +135,26 @@ private:
   // Core function to make sure value is loaded, check against all conditions including
   // NCCL_NO_CACHE
   std::unique_lock<std::mutex> ensureLoaded() {
+    // 判断是否已经加载过，分支预测为 true
     if (NCCL_PARAM_COMPILER_EXPECT(loaded.load(std::memory_order_relaxed), true)) {
+      // 如果是缓存参数且缓存未被禁用，则快速返回
       if ((info.flags & NCCL_PARAM_FLAG_CACHED) &&
           NCCL_PARAM_COMPILER_EXPECT(!ncclParamIsCacheDisabled(info.key), true)) {
         // fast path for cached parameters
         return {};
       } else {
+        // 不是缓存参数或者缓存被禁用了，则需要加载值
         std::unique_lock<std::mutex> lock(mtx);
         loadValue();
         return lock;
       }
     } else {
+      // 如果没有加载过，则需要加载值
       std::unique_lock<std::mutex> lock(mtx);
+      // 判断是否已经加载过，分支预测为 false
       if (NCCL_PARAM_COMPILER_EXPECT(!loaded.load(std::memory_order_acquire), true)) {
         loadValue();
+        // 标记已经加载过
         loaded.store(true, std::memory_order_release);
       }
       return lock;
@@ -150,12 +163,16 @@ private:
 
   // Load value from environment variable via EnvPlugin chain
   void loadValue() {
+    // 是否从 EnvPlugin 获取参数值
     // Special params with NO_ENVPLUGIN_INIT flag do not try init EnvPlugin
     bool tryEnvPluginInit = !(info.flags & NCCL_PARAM_FLAG_NO_ENVPLUGIN_INIT);
+    // 获取参数字符串值
     const char* envPluginValue = ncclParamEnvPluginGet(info.key, tryEnvPluginInit);
     if (envPluginValue != nullptr) {
       T resolvedValue;
+      // 获取的字符串解析为参数值类型
       ncclResult_t resolved = parser.resolve(envPluginValue, resolvedValue);
+      // 解析成功并且满足验证条件
       if (resolved == ncclSuccess && parser.validate(resolvedValue)) {
         value = resolvedValue;
         srcStr = nccl::param::utils::srcEnvPlugin();

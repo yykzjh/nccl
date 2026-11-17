@@ -18,9 +18,14 @@
 
 // CUmemFabricHandle compatibility definitions are now in mem_manager.h
 
+/*
+成员	  类型/大小	                   装什么	                                                                   走哪条路
+data	  uint64_t,8 字节	            CUmemGenericAllocationHandle(即 unsigned long long,进程私有的 VMM 物理句柄)	POSIX FD 路(同节点)
+handle	CUmemFabricHandle,64 字节	  FABRIC 句柄(自包含、硬件级、可直接广播)	                                      FABRIC 路(MNNVL 跨节点)
+*/
 typedef union {
-  uint64_t data; // Needs to hold a CUmemGenericAllocationHandle for UDS fd support
-  CUmemFabricHandle handle;
+  uint64_t data;  // 8 字节，装 CUmemGenericAllocationHandle(进程私有 VMM 句柄)，之后经 UDS 现场换出来 fd
+  CUmemFabricHandle handle;  // 64 字节，装自包含、可跨节点广播的 FABRIC 句柄
 } ncclCuDesc;
 
 typedef union {

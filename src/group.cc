@@ -37,11 +37,23 @@ ncclResult_t ncclAsyncLaunch(struct ncclAsyncJob* job, ncclResult_t (*func)(stru
   ncclResult_t ret = ncclSuccess;
 
   job->destroyFlag = comm->destroyFlag;
+  /*
+  "异步框架"在这条路上根本没异步。func(job) 就在调用者线程里同步跑完，全套 bootstrap 建环、拓扑探测阻塞式执行，然后立刻 destructor(job) 销毁。
+  */
   if (ncclGroupDepth == 0) {
     ret = func(job);
     if (ret != ncclSuccess && undo) undo(job);
     if (destructor) destructor(job);
   } else {
+    /*
+    ncclGroupDepth > 0（包在 ncclGroupStart/End 里，或走 ncclCommSplit/ncclCommGrow 内部隐式 group），
+    func 一行都不执行，只是把三个函数指针和上下文存进 job，然后挂进线程局部侵入式队列 ncclAsyncJobs，
+    多个 communicator 的初始化可以并行，例如：
+    ncclGroupStart();
+      for (int i = 0; i < 8; i++) ncclCommInitRank(&comms[i], 8, id, i);
+    ncclGroupEnd();
+    8 个 job 攒在队列里，到 ncclGroupEnd() 时开 8 个线程同时跑 bootstrap。若走支路 A 串行执行，第 0 个 rank 会卡在等其他 rank 报到，直接死锁。
+    */
     job->func = func;
     job->undo = undo;
     job->destructor = destructor;
@@ -55,13 +67,16 @@ ncclResult_t ncclAsyncLaunch(struct ncclAsyncJob* job, ncclResult_t (*func)(stru
     if (comm->destroyFlag) {
       ncclGroupBlocking = 1;
     } else if (ncclGroupBlocking == -1) {
+      // 第一个 comm 定调，后续必须一致。
       /* first met communicator */
       ncclGroupBlocking = comm->config.blocking;
     } else if (ncclGroupBlocking != comm->config.blocking) {
+      // 混用 blocking 与 nonblocking comm 直接报错。因为 ncclGroupEnd 只有一个返回值，没法对一半 job 说"完成了"、对另一半说"还在跑"。
       WARN("Blocking and nonblocking communicators are not allowed in the same group.");
       ret = ncclInvalidArgument;
     }
     if (ret == ncclSuccess) {
+      // 将 job 入 ncclAsyncJobs 队尾
       ncclIntruQueueEnqueue(&ncclAsyncJobs, job);
     } else {
       // no need to undo, the job hasn't run

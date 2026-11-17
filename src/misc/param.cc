@@ -31,6 +31,7 @@ void setEnvFile(const char* fileName) {
   char line[4096];
   char envVar[1024];
   char envValue[1024];
+  // 从 NCCL_CONF_FILE 指定的配置文件中读取带 = 的配置行，解析出 key 和 value
   while (fgets(line, (int)sizeof(line), file) != NULL) {
     size_t len = strlen(line);
     if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
@@ -44,6 +45,7 @@ void setEnvFile(const char* fileName) {
     s++;
     strncpy(envValue, line + s, 1023);
     envValue[1023] = '\0';
+    // 将解析出的 key 和 value 设置为环境变量，shell 导出的优先，这里的设置的优先级较低
     ncclOsSetEnv(envVar, envValue);
   }
   fclose(file);
@@ -54,20 +56,24 @@ static void initEnvFunc() {
   const char* userFile = std::getenv("NCCL_CONF_FILE");
   if (userFile && strlen(userFile) > 0) {
     snprintf(confFilePath, sizeof(confFilePath), "%s", userFile);
+    // 解析 NCCL_CONF_FILE 指定的配置文件中的环境变量配置并尝试导出为 OS 的环境变量
     setEnvFile(confFilePath);
   } else {
     const char* userDir = userHomeDir();
     if (userDir) {
+      // 会尝试默认读取 ~/.nccl.conf 文件中的环境变量配置并尝试导出为 OS 的环境变量
       snprintf(confFilePath, sizeof(confFilePath), "%s/.nccl.conf", userDir);
       setEnvFile(confFilePath);
     }
   }
+  // 最后会尝试读取 /etc/nccl.conf 文件中的环境变量配置并尝试导出为 OS 的环境变量
   snprintf(confFilePath, sizeof(confFilePath), "/etc/nccl.conf");
   setEnvFile(confFilePath);
 }
 
 void initEnv() {
   static std::once_flag once;
+  // 确保解析 NCCL 配置文件到环境变量只执行一次
   std::call_once(once, initEnvFunc);
 }
 

@@ -18,6 +18,8 @@
 
 // Parsers for default types
 
+
+// 默认所有类型都不支持，对于支持的类型进行特化
 // Primary template - catch all for unsupported types
 template <typename T>
 struct ncclParamParserDefault {
@@ -39,6 +41,7 @@ struct ncclParamParserDefault {
 // Specialization for bool
 template <>
 struct ncclParamParserDefault<bool> {
+  // 兼容识别多种布尔表示
   static ncclResult_t resolve(const char* input, bool& out) {
     if (input == nullptr) return ncclInvalidArgument;
     std::string s(input);
@@ -86,17 +89,22 @@ struct ncclParamParserDefault<const char*> {
   static constexpr const char* desc = "String";
 };
 
+// 所有整数类型共用的解析逻辑，整数解析器基类
 // Helper base for integer types
 template <typename T>
 struct ncclIntegerParser {
+  // 区分有符号整数和无符号整数，分别用 std::strtoll 和 std::strtoull 转换
   static ncclResult_t resolve(const char* input, T& out) {
     if (input == nullptr || *input == '\0') return ncclInvalidArgument;
     char* endPtr = nullptr;
     errno = 0;
+    // 判断是不是有符号整数
     if NCCL_PARAM_IF_CONSTEXPR (std::is_signed<T>::value) {
-      long long val = std::strtoll(input, &endPtr, 10);
+      long long val = std::strtoll(input, &endPtr, 10); // endPtr 保存第一个未解析字符的指针
+      // errno == ERANGE	超出 long long 范围
+      // errno == EINVAL	转换参数非法，例如空字符串
       if (endPtr == input || *endPtr != '\0' || errno == ERANGE || errno == EINVAL) return ncclInvalidArgument;
-      out = static_cast<T>(val);
+      out = static_cast<T>(val); // 这里没有验证整数值是否在 T 的范围内
     } else {
       unsigned long long val = std::strtoull(input, &endPtr, 10);
       if (endPtr == input || *endPtr != '\0' || errno == ERANGE || errno == EINVAL) return ncclInvalidArgument;
@@ -105,6 +113,7 @@ struct ncclIntegerParser {
     return ncclSuccess;
   }
 
+  // 这里验证无意义，因为 static_cast 已经确保了值在 T 的范围内
   static bool validate(const T& val) {
     return val >= std::numeric_limits<T>::min() && val <= std::numeric_limits<T>::max();
   }
@@ -141,6 +150,8 @@ namespace nccl {
 namespace param {
 namespace parser {
 
+
+// 适配 ncclParamParser<T> 的函数签名，即增加一个 void* ctx 参数
 template <typename T>
 ncclResult_t defaultResolve(const void*, const char* input, T& out) {
   return ncclParamParserDefault<T>::resolve(input, out);
@@ -175,9 +186,11 @@ bool boundedValidate(const void* ctx, const T& val) {
 // ============================================================================
 // Factory for default parser of type T
 // ============================================================================
+// 默认 parser 的工厂函数，返回一个静态单例 parser
 template <typename T>
 const ncclParamParser<T>& ncclParamDefault() {
   using namespace nccl::param::parser;
+  // 每个类型 T 只创建一份默认 parser
   static const ncclParamParser<T> instance{defaultResolve<T>, defaultValidate<T>, defaultToString<T>, nullptr,
                                            ncclParamParserDefault<T>::desc};
   return instance;
@@ -187,6 +200,7 @@ const ncclParamParser<T>& ncclParamDefault() {
 // Bounded Parser Factory
 // ============================================================================
 
+// 创建一个“有范围限制”的 parser
 // ncclParamBounded: is based on default parser with upper and lower bounds
 // using resolve and toString of the default parser, customize validate function
 template <typename T>
