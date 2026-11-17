@@ -16,6 +16,9 @@ junits/
 /plugins/net/example/*.so
 /plugins/mixed/example/*.so
 /plugins/net/mock/*.so
+/plugins/profiler/example/*.so
+/plugins/profiler/inspector/*.so
+/plugins/profiler/inspector/version.cc
 *.gcov
 /coverage/
 tags
@@ -37,3 +40,4 @@ docs/examples/**/rmsnorm_lsa
 docs/examples/**/rmsnorm_multimem
 docs/examples/**/rmsnorm_gin
 docs/examples/**/rmsnorm_hybrid
+docs/examples/**/ring_exchange

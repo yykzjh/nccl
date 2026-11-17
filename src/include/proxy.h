@@ -22,6 +22,7 @@
 #include "gin/gin_host.h"
 #endif
 #include "os.h"
+#include "profiler_event.h"
 
 #include <atomic>
 #include <mutex>
@@ -43,7 +44,6 @@ typedef enum : uint8_t {
   ncclPatternPatDown,
   ncclPatternSend,
   ncclPatternRecv,
-  ncclPatternProfiler,
 } ncclPattern_t;
 
 enum ncclProxyOpState {
@@ -103,24 +103,15 @@ struct ncclProxyOp {
   union ncclProxyOpSpecifics specifics;
   int nChannels;
   int nPeers;
+  int minPeers;
 
   // Profiler plugin
   union {
     struct ncclTaskColl* coll;
     struct ncclTaskP2p* p2p;
   } task;
-
-  // Profiler work counter increment flag. Set to 'true' if the profiler work counter for this channel needs
-  // increment.
-  // Always 'true' for collective operations. Grouped p2p operations are fused into one <send, recv> pair in the GPU
-  // kernel,
-  // meaning the GPU profiler code increments the work counter for the pair rather than the individual p2p. For this
-  // reason, the incWorkCounter flag is used to avoid incrementing the work counter twice in the host code. This is
-  // done
-  // by setting incWorkCounter to 'true' only for one of the p2ps in the pair during enqueue.
-  bool incWorkCounter;
   int eActivationMask;
-  void* taskEventHandle;
+  struct ncclProfilerEventRef taskEventHandle;
   int rank;
   int peer;
   ncclPid_t pid;
@@ -133,7 +124,7 @@ struct ncclProxyOp {
 struct ncclProxySubArgs;
 
 struct ncclProxyEventHandle {
-  void* stepEventHandle;
+  struct ncclProfilerEventRef stepEventHandle;
   struct ncclProxySubArgs* subArgPtr;
 };
 
@@ -171,9 +162,9 @@ struct ncclProxySubArgs {
   int rank;
   ncclPid_t pid;
   void* profilerContext;
-  void* taskEventHandle;
-  void* opEventHandle;
-  void* kernelEventHandle;
+  struct ncclProfilerEventRef taskEventHandle;
+  struct ncclProfilerEventRef opEventHandle;
+  struct ncclProfilerEventRef kernelEventHandle;
   struct ncclProxyEventHandle pHandles[NCCL_STEPS];
   size_t transSize;
   uint64_t workCounter;
@@ -208,6 +199,7 @@ struct ncclProxyArgs {
   int sharedSize[NCCL_STEPS];
   int nChannels;
   int nPeers;
+  int minPeers;
 
   int idle;
 
@@ -231,9 +223,17 @@ struct ncclProxyOpsPool {
   volatile int nextOps;
   volatile int nextOpsEnd;
   volatile int freeOps[NCCL_MAX_LOCAL_RANKS];
+  int syncObjectsInitialized;
   std::mutex mutex;
   std::condition_variable cond;
 };
+
+// Profiler handles sit inside both this pool and the ncclProxyArgs pool, which
+// together replicate them hundreds of thousands of times per rank. See
+// profiler_event.h for the per-slot cost before relaxing this.
+static_assert(sizeof(struct ncclProfilerEventRef) <= 2 * sizeof(void*),
+              "NCCL_PROFILER_MAX_PLUGINS is replicated across the proxy op and proxy args pools; "
+              "each additional slot costs megabytes of host memory per rank");
 
 struct ncclProxyOps {
   ncclProxyOpsPool* pool;
@@ -246,7 +246,7 @@ struct ncclProxyOps {
 
 struct ncclProxySharedP2p {
   int refcount;
-  int size;
+  ssize_t size;
   char* cudaBuff;
   char* hostBuff;
   // CUDA IPC
@@ -276,7 +276,7 @@ struct ncclProxyProgressState {
   char opsPoolShmSuffix[16];
 
   std::thread thread;
-  volatile int stop;
+  std::atomic<int> stop{0};
   struct ncclProxyPeer** localPeers;
   struct ncclSharedNetComms* netComms[NCCL_MAX_NETDEVS];
   struct ncclProxyArgs* active;
@@ -310,6 +310,7 @@ struct ncclProxyLocalPeer {
   int tpLocalRank;
   ncclProxyAsyncOp* asyncOps;
   int asyncOpCounter;
+  uint64_t id; // Unique id per accepted peer for connection identification
 };
 
 // Common response header for all proxyOps
@@ -343,9 +344,9 @@ struct ncclProxyState {
   int buffSizes[NCCL_NUM_PROTOCOLS];
   bool allocP2pNetLLBuffers;
   bool dmaBufSupport;
+  bool cuMemHostEnabled;
   ncclNet_t* ncclNet;
   ncclCollNet_t* ncclCollNet;
-  struct ncclGinState* ginState;
   uint32_t* abortFlag;
   bool directMode;
   struct ncclMemManager* memManager;  // Shared memory manager for proxy allocations
@@ -399,6 +400,7 @@ struct ncclProxyConnection {
   int send, transport, shared;
   int tpLocalRank, sameProcess;
   struct ncclSocket* sock;
+  uint64_t peerId; // Initialized with peer->id, used for connection checks
   struct ncclTransportComm* tcomm;
   struct ncclProxyArgs* proxyAppend;
   struct ncclProxyArgs** proxyAppendPtr;
@@ -457,11 +459,11 @@ ncclResult_t ncclPollProxyResponse(struct ncclComm* comm, struct ncclProxyConnec
                                    void* opId);
 
 // UDS support
-ncclResult_t ncclProxyClientGetFdBlocking(struct ncclComm* comm, int rank, void* handle, int* convertedFd);
-ncclResult_t ncclProxyClientQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int localFd,
-                                            int* rmtFd);
+ncclResult_t ncclProxyClientGetFdBlocking(struct ncclComm* comm, int rank, void* handle, ncclIpcFd* convertedFd);
+ncclResult_t ncclProxyClientQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn,
+                                            ncclIpcFd localFd, ncclIpcFd* rmtFd);
 ncclResult_t ncclProxyClientBatchQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn,
-                                                 int* localFds, int* rmtFds, int numSegments);
+                                                 ncclIpcFd* localFds, ncclIpcFd* rmtFds, int numSegments);
 
 ncclResult_t ncclProxyStop(struct ncclComm* comm);
 ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm);

@@ -31,6 +31,10 @@ struct ginCollComm {
 struct ginCtx {
   int nSignals;
   int nCounters;
+  int nContexts;
+  int queueDepth;
+  int trafficClass;
+  int backendVersion;
 };
 
 struct ginMemHandle {
@@ -73,6 +77,10 @@ __hidden ncclResult_t ginConnect(void* ctx, void* handles[], int nranks, int ran
   comm->rank = rank;
   *collComm = comm;
   return ncclSuccess;
+}
+
+__hidden ncclResult_t ginConnect_v15(void* ctx, void* handles[], int nranks, int rank, void* listenComm, void** collComm, volatile uint32_t* abortFlag) {
+  return ginConnect(ctx, handles, nranks, rank, listenComm, collComm);
 }
 
 __hidden ncclResult_t ginRegMrSym(void* collComm, void* data, size_t size, int type, uint64_t mrFlags, void** mhandle, void** ginHandle) {
@@ -327,6 +335,69 @@ __hidden ncclResult_t ginProgress_v13(void* ginCtx) {
   return ncclSuccess;
 }
 
+/* v14-specific functions */
+
+__hidden ncclResult_t ginGetGinProperties_v14(ncclGinProperties_v14_t* ginProps) {
+  ginProps->supportsStrongSignals = true;
+  ginProps->supportsVASignals = true;
+  return ncclSuccess;
+}
+
+__hidden ncclResult_t ginCreateContext_v14(void* collComm, ncclGinConfig_v14_t* config, void** ginCtxOut, ncclNetDeviceHandle_v11_t** devHandle) {
+  struct ginCtx* gc = (struct ginCtx*)calloc(1, sizeof(*gc));
+  if (gc == NULL) return ncclSystemError;
+  gc->nSignals = config->nSignals;
+  gc->nCounters = config->nCounters;
+  gc->nContexts = config->nContexts;
+  gc->queueDepth = config->queueDepth;
+  gc->trafficClass = config->trafficClass;
+  gc->backendVersion = config->backendVersion;
+
+  ncclNetDeviceHandle_v11_t* dh = (ncclNetDeviceHandle_v11_t*)calloc(1, sizeof(*dh));
+  if (dh == NULL) { free(gc); return ncclSystemError; }
+  dh->netDeviceType = NCCL_NET_DEVICE_GIN_PROXY;
+  dh->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
+  dh->handle = NULL;
+  dh->size = 0;
+  dh->needsProxyProgress = 0;
+
+  *ginCtxOut = gc;
+  *devHandle = dh;
+  return ncclSuccess;
+}
+
+/* v15-specific functions */
+
+__hidden ncclResult_t ginGetGinProperties_v15(ncclGinProperties_v15_t* ginProps) {
+  ginProps->supportsStrongSignals = true;
+  ginProps->supportsVASignals = true;
+  ginProps->barrierOptions = NCCL_GIN_BARRIER_DEFAULT;
+  return ncclSuccess;
+}
+
+__hidden ncclResult_t ginCreateContext_v15(void* collComm, ncclGinConfig_v15_t* config, void** ginCtxOut, ncclNetDeviceHandle_v11_t** devHandle) {
+  struct ginCtx* gc = (struct ginCtx*)calloc(1, sizeof(*gc));
+  if (gc == NULL) return ncclSystemError;
+  gc->nSignals = config->nSignals;
+  gc->nCounters = config->nCounters;
+  gc->nContexts = config->nContexts;
+  gc->queueDepth = config->queueDepth;
+  gc->trafficClass = config->trafficClass;
+  gc->backendVersion = config->backendVersion;
+
+  ncclNetDeviceHandle_v11_t* dh = (ncclNetDeviceHandle_v11_t*)calloc(1, sizeof(*dh));
+  if (dh == NULL) { free(gc); return ncclSystemError; }
+  dh->netDeviceType = NCCL_NET_DEVICE_GIN_PROXY;
+  dh->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
+  dh->handle = NULL;
+  dh->size = 0;
+  dh->needsProxyProgress = 0;
+
+  *ginCtxOut = gc;
+  *devHandle = dh;
+  return ncclSuccess;
+}
+
 /* Exported plugin structs */
 
 const ncclGin_v11_t ncclGinPlugin_v11 = {
@@ -392,6 +463,48 @@ const ncclGin_v13_t ncclGinPlugin_v13 = {
   .iget = ginIget_v13,
   .iflush = ginIflush_v13,
   .test = ginTest,
+  .ginProgress = ginProgress_v13,
+  .queryLastError = ginQueryLastError,
+  .finalize = ginFinalize,
+};
+
+/* v14: data operations (iput/iputSignal/iget/iflush) are no longer part of the GIN interface.
+ * They moved to the RMA plugin (ncclRma_v14_t). See plugins/rma/example for a reference. */
+const ncclGin_v14_t ncclGinPlugin_v14 = {
+  .name = "Example",
+  .init = ginInit,
+  .devices = ginDevices,
+  .getProperties = ginGetProperties_v13,
+  .getGinProperties = ginGetGinProperties_v14,
+  .listen = ginListen,
+  .connect = ginConnect,
+  .createContext = ginCreateContext_v14,
+  .regMrSym = ginRegMrSym,
+  .regMrSymDmaBuf = ginRegMrSymDmaBuf,
+  .deregMrSym = ginDeregMrSym,
+  .destroyContext = ginDestroyContext,
+  .closeColl = ginCloseColl,
+  .closeListen = ginCloseListen,
+  .ginProgress = ginProgress_v13,
+  .queryLastError = ginQueryLastError,
+  .finalize = ginFinalize,
+};
+
+const ncclGin_v15_t ncclGinPlugin_v15 = {
+  .name = "Example",
+  .init = ginInit,
+  .devices = ginDevices,
+  .getProperties = ginGetProperties_v13,
+  .getGinProperties = ginGetGinProperties_v15,
+  .listen = ginListen,
+  .connect = ginConnect_v15,
+  .createContext = ginCreateContext_v15,
+  .regMrSym = ginRegMrSym,
+  .regMrSymDmaBuf = ginRegMrSymDmaBuf,
+  .deregMrSym = ginDeregMrSym,
+  .destroyContext = ginDestroyContext,
+  .closeColl = ginCloseColl,
+  .closeListen = ginCloseListen,
   .ginProgress = ginProgress_v13,
   .queryLastError = ginQueryLastError,
   .finalize = ginFinalize,

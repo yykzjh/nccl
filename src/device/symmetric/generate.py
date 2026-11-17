@@ -58,6 +58,10 @@ reductions = ["AllReduce","ReduceScatter"]
 all_reds = ["sum", "avg"]
 all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2"]
 gin_algos = ["RailA2A_LsaLD", "RailA2A_LsaLDMC", "RailRing_LsaSTMC"]
+alltoall_gin_algos = ["LL"]
+
+def is_gin_kernel(k):
+  return k.algo in gin_algos or (k.coll == "AlltoAll" and k.algo in alltoall_gin_algos)
 tma_algos = ["TmaST", "TmaSTMC", "TmaLD", "RSxTmaLD_AGxTmaST"]
 
 nvls_algos_by_coll = {
@@ -69,6 +73,7 @@ ldmc_algos = ["RSxLDMC_AGxSTMC", "LDMC", "RailA2A_LsaLDMC"]
 coll_to_lower = {
   "AllGather": "all_gather",
   "AllReduce": "all_reduce",
+  "AlltoAll": "alltoall",
   "ReduceScatter": "reduce_scatter"
 }
 
@@ -99,6 +104,8 @@ ty_to_cxxtype = {
 def enumerate_kernels():
   for algo in ["LL","LLMC","ST","STMC","TmaST","TmaSTMC","RailRing_LsaSTMC"]:
     yield Rec(coll="AllGather", algo=algo)
+  for algo in ["LL"]:
+    yield Rec(coll="AlltoAll", algo=algo)
   for red in all_reds:
     for ty in all_tys:
       for algo in ["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC","RSxTmaLD_AGxTmaST"]:
@@ -127,23 +134,37 @@ def required_cuda(k):
       if k.algo in ldmc_algos:
         cudart = 12070
         arch = None
-        specific_sms = ["100a", "101a", "100f", "101f", "120a", "121a"]
+        specific_sms = ["100a", "101a", "107", "100f", "101f", "120a", "121a"]
   return (cudart, arch, specific_sms)
 
 ################################################################################
 
+def alltoall_gin_fbase(k):
+  if k.coll == "AlltoAll" and k.algo == "LL": return "alltoall_LL"
+  return None
+
 def kernel_fbase(k):
-  return coll_to_lower[k.coll] + ("_gin" if k.algo in gin_algos else "")
+  fbase = alltoall_gin_fbase(k)
+  if fbase is not None: return fbase
+  return coll_to_lower[k.coll] + ("_gin" if is_gin_kernel(k) else "")
 
 def kernel_fname(k):
+  fbase = alltoall_gin_fbase(k)
+  if fbase is not None: return fbase + '.cu'
   parts = [coll_to_lower[k.coll]]
-  if k.algo in gin_algos: parts += ['gin']
+  if is_gin_kernel(k): parts += ['gin']
   if k.coll in reductions:
     if k.algo in ldmc_algos and k.ty.startswith('f8'):
       parts += [k.red, k.ty, k.algo]
     else:
       parts += [k.red, k.ty]
   return paste('_', *parts) + '.cu'
+
+# Sibling .cu holding the instrumented (_profile) instantiations, kept separate so
+# `make -j` compiles the default and profile variants concurrently.
+def profile_fname(fname):
+  assert fname.endswith('.cu')
+  return fname[:-len('.cu')] + '_profile.cu'
 
 def kernel_gencode(k):
   if k.coll in reductions and k.algo in ldmc_algos and k.ty.startswith('f8'):
@@ -168,72 +189,71 @@ def kernel_conds(k):
     arch_cond = " || ".join(["0"] + ["NCCL_CUDA_ARCH_%sSPECIFIC==%d"%("FAMILY_" if sm[-1] == "f" else "", 10*int(sm.replace('a', '').replace('f', ''))) for sm in specific_sms])
   return cudart_cond, arch_cond
 
-def instantiate(k):
-  cudart_cond, arch_cond = kernel_conds(k)
-  if (cudart_cond, arch_cond) == (None, None):
-    form_red_ty = (
-      "__global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
-      "  #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
-      "    cudaGridDependencySynchronize();\n"
-      "  #endif\n"
-      "  ncclSymkRun_{id}<{red}, {ty}>(&args4K.args);\n"
-      "}}"
-    )
-    form = (
-      "__global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
-      "  #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
-      "    cudaGridDependencySynchronize();\n"
-      "  #endif\n"
-      "  ncclSymkRun_{id}(&args4K.args);\n"
-      "}}"
-    )
-  else:
-    form_red_ty = (
-      "#if {cudart_cond}\n"
-      "  __global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
-      "    #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
-      "      cudaGridDependencySynchronize();\n"
-      "    #endif\n"
-      "    #if {arch_cond}\n"
-      "      ncclSymkRun_{id}<{red}, {ty}>(&args4K.args);\n"
-      "    #endif\n"
-      "  }}\n"
-      "#endif"
-    )
-    form = (
-      "#if {cudart_cond}\n"
-      "  __global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
-      "    #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
-      "      cudaGridDependencySynchronize();\n"
-      "    #endif\n"
-      "    #if {arch_cond}\n"
-      "      ncclSymkRun_{id}(&args4K.args);\n"
-      "    #endif\n"
-      "  }}\n"
-      "#endif"
-    )
+# Each kernel has two __global__ entrypoints: {cname} -> ncclSymkRun_{id}<false,...>
+# (no profiler code) and {cname}_profile -> Start + ncclSymkRun_{id}<true,...> + Stop.
+# The host selects the _profile variant only when profiling is active.
+def kernel_cname_profile(k):
+  return kernel_cname(k) + "_profile"
 
-  id = k.coll+'_'+k.algo
-  cname = kernel_cname(k)
+def instantiate(k, profile):
+  cudart_cond, arch_cond = kernel_conds(k)
+  id = k.coll + '_' + k.algo
+  cname = kernel_cname_profile(k) if profile else kernel_cname(k)
+  prof = 'true' if profile else 'false'
   if k.coll in reductions:
-    inst = form_red_ty.format(cname=cname, id=id, red=red_to_Func[k.red], ty=ty_to_cxxtype[k.ty], cudart_cond=cudart_cond, arch_cond=arch_cond)
+    targs = '<{prof}, {red}, {ty}>'.format(prof=prof, red=red_to_Func[k.red], ty=ty_to_cxxtype[k.ty])
   else:
-    inst = form.format(cname=cname, id=id, cudart_cond=cudart_cond, arch_cond=arch_cond)
-  return inst
+    targs = '<{prof}>'.format(prof=prof)
+
+  if (cudart_cond, arch_cond) == (None, None):
+    start = '  ncclSymkProfilerStart(&args4K.args);\n' if profile else ''
+    stop  = '  ncclSymkProfilerStop(&args4K.args);\n' if profile else ''
+    form = (
+      "__global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
+      "  #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
+      "    cudaGridDependencySynchronize();\n"
+      "  #endif\n"
+      "{start}"
+      "  ncclSymkRun_{id}{targs}(&args4K.args);\n"
+      "{stop}"
+      "}}"
+    )
+    return form.format(cname=cname, id=id, targs=targs, start=start, stop=stop)
+  else:
+    start = '    ncclSymkProfilerStart(&args4K.args);\n' if profile else ''
+    stop  = '    ncclSymkProfilerStop(&args4K.args);\n' if profile else ''
+    form = (
+      "#if {cudart_cond}\n"
+      "  __global__ void {cname}(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4K) {{\n"
+      "    #if CUDART_VERSION >= 12030 && __CUDA_ARCH__ >= 900\n"
+      "      cudaGridDependencySynchronize();\n"
+      "    #endif\n"
+      "{start}"
+      "    #if {arch_cond}\n"
+      "      ncclSymkRun_{id}{targs}(&args4K.args);\n"
+      "    #endif\n"
+      "{stop}"
+      "  }}\n"
+      "#endif"
+    )
+    return form.format(cname=cname, id=id, targs=targs, start=start, stop=stop, cudart_cond=cudart_cond, arch_cond=arch_cond)
 
 def prototype(k):
   cudart_cond, arch_cond = kernel_conds(k)
-  if cudart_cond is None:
-    form = "__global__ void {cname}(ncclSymkDevWorkArgs4K const);"
-  else:
-    form = (
-      "#if {cudart_cond}\n"
-      "  __global__ void {cname}(ncclSymkDevWorkArgs4K const);\n"
-      "#else\n"
-      "  constexpr void* {cname} = nullptr;\n"
-      "#endif"
-    )
-  return form.format(cname=kernel_cname(k), cudart_cond=cudart_cond)
+  out = []
+  for cname in (kernel_cname(k), kernel_cname_profile(k)):
+    if cudart_cond is None:
+      form = "__global__ void {cname}(ncclSymkDevWorkArgs4K const);"
+    else:
+      form = (
+        "#if {cudart_cond}\n"
+        "  __global__ void {cname}(ncclSymkDevWorkArgs4K const);\n"
+        "#else\n"
+        "  constexpr void* {cname} = nullptr;\n"
+        "#endif"
+      )
+    out.append(form.format(cname=cname, cudart_cond=cudart_cond))
+  return "\n".join(out)
 
 ################################################################################
 
@@ -248,7 +268,7 @@ def partition(vals, keyfn):
 
 
 # When exclude_gin (Windows), do not generate or reference any GIN kernels.
-kernels_to_build = [k for k in enumerate_kernels() if not (exclude_gin and k.algo in gin_algos)]
+kernels_to_build = [k for k in enumerate_kernels() if not (exclude_gin and is_gin_kernel(k))]
 kernels_by_file = partition(kernels_to_build, lambda k: (kernel_fname(k), kernel_fbase(k)))
 
 # Add dependency only files (e.g. allreduce.cu)
@@ -258,7 +278,8 @@ for fbase in set(kernel_fbase(k) for k in kernels_to_build):
     kernels_by_file[fname, fbase] = []
 
 files_to_print = ""
-# Generate each kernel instantiation file (no GIN .cu files when exclude_gin)
+# Generate each kernel instantiation file (no GIN .cu when exclude_gin), plus a
+# sibling _profile.cu with the instrumented variants.
 for (fname, fbase), ks in kernels_by_file.items():
   files_to_print += fname + ";"
   with open(os.path.join(gensrc, fname), "w") as f:
@@ -266,7 +287,16 @@ for (fname, fbase), ks in kernels_by_file.items():
     emitln(f, '#include "symmetric/kernel.cuh"')
     emitln(f, '#include "symmetric/{fbase}.cuh"'.format(fbase=fbase))
     for k in ks:
-      emitln(f, instantiate(k))
+      emitln(f, instantiate(k, profile=False))
+  if ks:
+    pfname = profile_fname(fname)
+    files_to_print += pfname + ";"
+    with open(os.path.join(gensrc, pfname), "w") as f:
+      emitln(f, '#include "sym_kernels.h"')
+      emitln(f, '#include "symmetric/kernel.cuh"')
+      emitln(f, '#include "symmetric/{fbase}.cuh"'.format(fbase=fbase))
+      for k in ks:
+        emitln(f, instantiate(k, profile=True))
 
 # Generate <gensrc>/sym_kernels_host.cc (kernel list already excludes GIN when exclude_gin)
 with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
@@ -287,6 +317,14 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
   emitln(f, 'nullptr};')
   emitln(f, '')
 
+  # Parallel list of instrumented variants, indexed identically to
+  # ncclSymkKernelList (ncclSymkGetKernelIndex / requirements / smem are shared).
+  emitln(f, 'void* ncclSymkKernelListProfile[] = {')
+  for k in kernel_list:
+    emitln(f, '(void*){cname},'.format(cname=kernel_cname_profile(k)))
+  emitln(f, 'nullptr};')
+  emitln(f, '')
+
   emitln(f, 'int ncclSymkKernelRequirements[] = {')
   for index,k in enumerate(kernel_list):
     cudart, _, _ = required_cuda(k)
@@ -296,6 +334,7 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
   emitln(f, '')
 
   emitln(f, 'int ncclSymkKernelMaxDynamicSmem[%d];' % len(kernel_list))
+  emitln(f, 'int ncclSymkKernelMaxThreads[%d];' % len(kernel_list))
   emitln(f, '')
 
   emitln(f, 'int ncclSymkGetKernelIndex(ncclSymkKernelId id, int red, ncclDataType_t ty) {')
@@ -328,23 +367,27 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
 # Output file list for CMake (excludes rules.mk since it's not generated for CMake)
 files_to_print += "sym_kernels_host.cc;"
 if os.environ.get("NCCL_USE_CMAKE", "0") == "1":
-  print(files_to_print)
+  print(files_to_print.rstrip(';'))
 
 # Generate <gensrc>/rules.mk (only needed for Makefile builds, not CMake)
 if os.environ.get("NCCL_USE_CMAKE", "0") != "1":
   with open(os.path.join(gensrc, "rules.mk"), "w") as f:
     inst_names = sorted(set(kernel_fname(k) for k in kernels_to_build))
-    names = inst_names + ["sym_kernels_host.cc"]
+    # Each kernel file has a sibling _profile.cu that must be compiled+linked too.
+    profile_names = [profile_fname(n) for n in inst_names]
+    names = inst_names + profile_names + ["sym_kernels_host.cc"]
     f.write("LIB_OBJS_SYM_GEN = $(patsubst %,$(OBJDIR)/genobj/symmetric/%.o,{names})\n"
             .format(names=" ".join(names)))
     f.write("\n")
 
     inst_names = sorted(set((kernel_fname(k), kernel_fbase(k), kernel_gencode(k)) for k in kernels_to_build))
     for fname, fbase, gencode in inst_names:
-      f.write(
-        "$(OBJDIR)/genobj/symmetric/{fname}.o: $(OBJDIR)/gensrc/symmetric $(OBJDIR)/genobj/symmetric/{fbase}.cu.d\n"
-        "\t" "$(call COMPILE_SYM,$@,$(OBJDIR)/gensrc/symmetric/{fname},{gencode})\n"
-        "\n"
-        .format(fname=fname, fbase=fbase, gencode=gencode)
-      )
-
+      # The default and profile translation units share fbase (same .cu.d) and
+      # gencode; they differ only by the source file compiled.
+      for src in (fname, profile_fname(fname)):
+        f.write(
+          "$(OBJDIR)/genobj/symmetric/{src}.o: $(OBJDIR)/gensrc/symmetric $(OBJDIR)/genobj/symmetric/{fbase}.cu.d\n"
+          "\t" "$(call COMPILE_SYM,$@,$(OBJDIR)/gensrc/symmetric/{src},{gencode})\n"
+          "\n"
+          .format(src=src, fbase=fbase, gencode=gencode)
+        )

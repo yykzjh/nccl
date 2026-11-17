@@ -1,20 +1,20 @@
 """CuTeDSL bindings for C struct types declared in
-``bindings/ir/nccl_device_wrapper.h`` and ``src/include/nccl_device/``.
+``bindings/ir/nccl_device_ir.h`` and ``src/include/nccl_device/``.
 
-Codegen target — each entry is 1:1 with a C struct definition.
-``_LLVMPtrType`` and ``_array_i8`` are MLIR-type adapters used as
+Codegen target -- each entry is 1:1 with a C struct definition.
+``_LLVMPtrType`` and ``_array_i64`` are MLIR-type adapters used as
 ``@cute.native_struct`` field annotations.
 """
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir import ir
+from cutlass.cutlass_dsl import ir
 
 
 # === MLIR type adapters ===
 
 class _LLVMPtrType:
-    """Wraps ``!llvm.ptr`` for use in ``cute.ffi`` signatures and as a
+    """Wraps ``!llvm.ptr`` for use in ``@cute.extern`` signatures and as a
     ``@cute.native_struct`` field annotation."""
 
     @staticmethod
@@ -25,14 +25,25 @@ class _LLVMPtrType:
     def __get_mlir_types__():
         return [_LLVMPtrType.mlir_type()]
 
+    @classmethod
+    def isinstance(cls, value):
+        """Match an ``!llvm.ptr`` ir.Value during ``@cute.extern`` dispatch.
 
-def _array_i8(n: int):
-    """Build a fixed-size byte array type for opaque struct storage."""
+        Callers pass pointers as bare ``!llvm.ptr`` ir.Values -- a wrapper's
+        ``.ptr``, or ``_to_ptr`` for an integer address -- so the extern
+        overload matcher needs this hook to recognize them against a
+        ``_LLVMPtrType`` annotation.
+        """
+        return isinstance(value, ir.Value) and value.type == cls.mlir_type()
+
+
+def _array_i64(n: int):
+    """Build a fixed-size, naturally 8-byte-aligned opaque storage array."""
 
     class T:
         @staticmethod
         def mlir_type():
-            return ir.Type.parse(f"!llvm.array<{n} x i8>")
+            return ir.Type.parse(f"!llvm.array<{n} x i64>")
 
     return T
 
@@ -76,34 +87,42 @@ class ncclMultimemHandle:
 
 
 @cute.native_struct
-class _ncclCoopStorage:
-    space: _array_i8(16)
+class ncclIrDevComm:
+    """Opaque DevComm storage from the matching NCCL device IR build."""
+
+    storage: _array_i64(31)
 
 
 @cute.native_struct
-class ncclCoopAny:
-    """``struct ncclCoopAny`` — 16-byte aligned-to-ptr storage + vtable ptr
-    (src/include/nccl_device/coop.h)."""
+class ncclIrCoop:
+    """Opaque 24-byte, 8-byte-aligned coop storage from the IR wrapper header."""
 
-    storage: _ncclCoopStorage
-    vtable: _LLVMPtrType
+    storage: _array_i64(3)
 
 
 @cute.native_struct
-class ncclGin_C:
-    """``struct ncclGin_C`` (src/include/nccl_device/gin.h).
+class ncclIrGin:
+    """Opaque 40-byte, 8-byte-aligned GIN storage from the IR wrapper header."""
 
-    The bitfield triple ``{nConnections:8, connectionId:8, _ginBackend:8}``
-    is represented as a single ``Uint32`` ``flags`` field; padding fields
-    match the natural alignment of the C++ layout.
-    """
+    storage: _array_i64(5)
 
-    comm: _LLVMPtrType
-    flags: cutlass.Uint32
-    contextId: cutlass.Uint32
-    resourceSharingMode: cutlass.Int8
-    _pad0: _array_i8(7)
-    ginHandle: _LLVMPtrType
-    signalShadows: _LLVMPtrType
-    backendMask: cutlass.Uint32
-    _pad1: _array_i8(4)
+
+@cute.native_struct
+class ncclIrLsaBarrierSession:
+    """Opaque LSA barrier session storage from the matching NCCL device IR build."""
+
+    storage: _array_i64(10)
+
+
+@cute.native_struct
+class ncclIrGinBarrierSession:
+    """Opaque GIN barrier session storage from the matching NCCL device IR build."""
+
+    storage: _array_i64(12)
+
+
+@cute.native_struct
+class ncclIrBarrierSession:
+    """Opaque hybrid barrier session storage from the matching NCCL device IR build."""
+
+    storage: _array_i64(46)

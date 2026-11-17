@@ -40,7 +40,7 @@ ncclResult_t ncclTopoComputeCommCPU(struct ncclComm* comm);
 ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoGraph* graph, int channelId,
                                int peerRank, int64_t* id, int* dev, int* proxyRank);
 ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* p2p,
-                              int* read, int* intermediateRank, int* cudaP2p);
+                              int* read, int* intermediateRank, int* cudaP2p, int* isCrossClique = nullptr);
 ncclResult_t ncclTopoCheckMNNVL(struct ncclComm* comm, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2,
                                 int* ret);
 enum ncclTopoGdrMode {
@@ -64,7 +64,6 @@ static inline uint32_t ncclGdcPinFlag(enum ncclTopoFlushType flush) {
 ncclResult_t ncclTopoNeedFlush(struct ncclComm* comm, int64_t netId, int netDev, int rank,
                                enum ncclTopoFlushType* flush);
 ncclResult_t ncclTopoGetMinNetBw(struct ncclTopoSystem* system, int rank, float* bw);
-ncclResult_t ncclTopoIsGdrAvail(struct ncclTopoSystem* system, int rank, bool* avail);
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net);
 int ncclPxnDisable(struct ncclComm* comm);
 ncclResult_t ncclTopoGetPxnRanks(struct ncclComm* comm, int** intermediateRanks, int* nranks);
@@ -75,6 +74,7 @@ ncclResult_t ncclGetUserP2pLevel(int* level);
 // Find CPU affinity
 ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, ncclAffinity* affinity);
 
+#define NCCL_TOPO_CPU_ARCH_UNDEF 0
 #define NCCL_TOPO_CPU_ARCH_X86 1
 #define NCCL_TOPO_CPU_ARCH_POWER 2
 #define NCCL_TOPO_CPU_ARCH_ARM 3
@@ -87,6 +87,9 @@ ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, ncc
 #define NCCL_TOPO_CPU_MODEL_INTEL_SKL 2
 #define NCCL_TOPO_CPU_MODEL_INTEL_SRP 3
 #define NCCL_TOPO_CPU_MODEL_INTEL_ERP 4
+#define NCCL_TOPO_CPU_MODEL_AMD_ZEN12 1
+#define NCCL_TOPO_CPU_MODEL_AMD_ZEN34 2
+#define NCCL_TOPO_CPU_MODEL_AMD_ZEN5 3
 #define NCCL_TOPO_CPU_MODEL_YONGFENG 1
 ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vendor, int* model);
 ncclResult_t ncclTopoGetGpuCount(struct ncclTopoSystem* system, int* count);
@@ -177,6 +180,7 @@ struct ncclTopoGraph {
   int maxChannels;
   // Output
   int nChannels;
+  int nCtasPerChannel;
   float bwIntra;
   float bwInter;
   float latencyInter;

@@ -64,6 +64,7 @@ struct ncclRmaWaitSignalOp {
   int npeers;
   int* waitPeers;
   int* waitSignals;
+  int* waitSignalIdxs;
   // Local flush in graph mode
   int needFlush;
 };
@@ -99,6 +100,8 @@ struct ncclRmaProxyDesc {
 
   // Graph capture fields
   struct ncclKernelPlan* persistPlan; // Back reference to persistent plan during clean up
+  bool captured;
+  struct ncclCudaGraph graph;
   bool persistDescValid; // Persistent descriptor is valid
 };
 
@@ -110,14 +113,23 @@ struct ncclRmaProxyCtx {
   void* rmaCtx;
   // ncclNetDeviceHandle_t *devHandle;
   ncclNetProperties_t props;
+  // Index into rmaComms / rmaHostWins used for this context's data-window handles.
+  int collCommIdx;
+
+  //---------Rail addressing---------
+  // Peer-indexing is only used for (1) connect() in ncclRmaProxyConnectOnce (2) iput/iputSignal in ncclRmaProxyIssuePutSignal (3) iput in ncclRmaProxyFlushNicGpuPath
+  // Rail size is comm->nRanks / comm->rmaBaseStride; this rank's rail index is comm->rank / comm->rmaBaseStride.
+
+  // Stride in global rank index between peers this context can address
+  int ctxStride;
 
   //---------Non-graph descriptor queues and synchronization---------
 
   // Lock-free circular buffer for pending Descs
-  size_t queueSize;  // Power of 2 size for pending queue
-  struct ncclRmaProxyDesc** circularBuffers;  // Lock-free circular buffer per peer
-  uint32_t* pis;  // Producer Indices per peer
-  uint32_t* cis;  // Consumer Indices per peer
+  size_t queueSize; // Power of 2 size for pending queue
+  struct ncclRmaProxyDesc** circularBuffers; // Lock-free circular buffer per peer
+  uint32_t* pis; // Producer Indices per peer
+  uint32_t* cis; // Consumer Indices per peer
 
   // Per-rank inProgressQueues: Descs with issued network operations waiting for completion
   struct ncclIntruQueue<struct ncclRmaProxyDesc, &ncclRmaProxyDesc::next>* inProgressQueues;
@@ -139,9 +151,9 @@ struct ncclRmaProxyCtx {
 
   // Signal memory layout and management
   // Each RMA context allocates a signal buffer with the following layout:
-  // - Offsets [0 to nRanks*8-1]: per-rank distinct signals (8 bytes per rank)
-  // - Offset [nRanks*8]: shared aggregate signal counter (8 bytes)
-  // Total signal buffer size: (nRanks + 1) * 8 bytes
+  // - One set of nRanks per-rank signal counters per signal index
+  // - Slot within this context is signalIdx * nRanks + rank
+  // Total signal buffer size: (numRmaSig * nRanks) * 8 bytes
   CUmemGenericAllocationHandle signalsCumemhandle;
   void* signalsMhandle;
   uint64_t* signalsDev;
@@ -153,6 +165,7 @@ struct ncclRmaProxyCtx {
   struct ncclIntruQueue<struct ncclRmaProxyDesc, &ncclRmaProxyDesc::next>* persistentQueues;
 
   // CPU-accessible signal is required as proxy needs to poll on the signal values
+  // Graph/persistent signals use the same per-(signalIdx, rank) layout.
   void* cpuAccessSignalsGdrHandle;
   void* cpuAccessSignalsMhandle;
   uint64_t* cpuAccessSignals;
@@ -178,10 +191,14 @@ struct ncclRmaProxyState {
   void* rmaComms[NCCL_GIN_MAX_CONNECTIONS];
   ncclNetProperties_t props[NCCL_GIN_MAX_CONNECTIONS];
 
-  // Virtual RMA proxy contexts
-  int rmaProxyCtxCount;
+  // Virtual RMA proxy contexts. The array holds the user-addressable contexts
+  // [0, numRmaCtx) followed by NCCL-internal contexts [numRmaCtx, numRmaCtx +
+  // numIntCtx) used by the hierarchical CE collectives' rail step. numIntCtx is
+  // 0 unless the internal-context guard holds (see ncclRmaProxyConnectOnce).
+  int rmaProxyCtxCount; // total = numRmaCtx + numIntCtx
+  int numIntCtx; // count of internal contexts (NCCL_RMA_INT_CTX_PER_NIC * rmaCommCount, or 0)
   void** rmaProxyCtxs;
-  int rmaProgress;         // RMA progress is enabled
+  int rmaProgress; // RMA progress is enabled
   std::thread thread;
   std::mutex mutex;
   std::condition_variable cond;
@@ -197,9 +214,19 @@ ncclResult_t ncclRmaProxyReclaimPlan(struct ncclComm* comm, struct ncclKernelPla
 ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm);
 ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm);
 
+// True when NCCL should provision internal RMA contexts for the hierarchical CE
+// collectives: zero-CTA policy, a multi-clique (non-single-LSA) comm, > 1 node.
+bool ncclRmaWantInternalCtx(struct ncclComm* comm);
+
+// Rail-related helper functions
+// world-indexing -> peer-indexing
+ncclResult_t ncclRmaProxyWorldToPeer(const struct ncclRmaProxyCtx* ctx, int worldRank, int* peer);
+// peer-indexing -> world-indexing
+int ncclRmaProxyPeerToWorld(struct ncclComm* comm, int peer);
+
 // RMA Proxy context management
-ncclResult_t ncclRmaProxyCreateContext(struct ncclComm* comm, void* collComm, ncclNetProperties_t props,
-                                       void** outRmaProxyCtx, ncclNetDeviceHandle_t** outDevHandle);
+ncclResult_t ncclRmaProxyCreateContext(struct ncclComm* comm, void* collComm, int rankStride, ncclNetProperties_t props,
+                                       int collCommIdx, void** outRmaProxyCtx);
 ncclResult_t ncclRmaProxyDestroyContext(ncclRma_t* rmaComm, void* rmaProxyCtx);
 ncclResult_t ncclRmaProxyProgress(ncclRma_t* ncclRma, void* rmaProxyCtx);
 void* ncclRmaProxyProgressThread(struct ncclRmaProxyState* rmaProxyState_);
@@ -236,13 +263,13 @@ bool ncclRmaProxyEnqueueFull(struct ncclRmaProxyCtx* ctx, const struct ncclRmaPr
 ncclResult_t ncclRmaProxyPutBuildOp(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx, int ctx,
                                     bool persistent, struct ncclDevrWindow* srcWin, size_t srcOff,
                                     struct ncclDevrWindow* peerWin, size_t peerOff, size_t size, int peer,
-                                    ncclSignalMode_t signalMode, struct ncclRmaPutSignalOp* op);
+                                    int signalIdx, ncclSignalMode_t signalMode, struct ncclRmaPutSignalOp* op);
 
 // Build a single put descriptor.
 ncclResult_t ncclRmaProxyPutBuildDesc(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx,
                                       struct ncclKernelPlan* plan, struct ncclDevrWindow* srcWinHost,
                                       size_t srcWinOffset, struct ncclDevrWindow* peerWinHost, size_t peerWinOffset,
-                                      size_t size, int peer, int ctx, ncclSignalMode_t signalMode,
+                                      size_t size, int peer, int ctx, int signalIdx, ncclSignalMode_t signalMode,
                                       struct ncclRmaProxyDesc* desc);
 
 // Build a put-signal-group descriptor over an array of pre-filled ops.
@@ -255,7 +282,7 @@ ncclResult_t ncclRmaProxyPutGroupBuildDesc(struct ncclComm* comm, struct ncclRma
 // Takes ownership of caller-allocated peers/nsignals arrays.
 ncclResult_t ncclRmaProxyWaitBuildDesc(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx,
                                        struct ncclKernelPlan* plan, int npeers, int** peers, int** nsignals,
-                                       struct ncclRmaProxyDesc* desc);
+                                       int** signalIdxs, struct ncclRmaProxyDesc* desc);
 
 // Stream-batch memop param builders for put descriptors.
 int ncclRmaProxyPutStartNumOps(bool persistent);
@@ -269,7 +296,12 @@ ncclResult_t ncclRmaProxyPutGroupStartParams(struct ncclRmaProxyDesc* desc, CUst
 int ncclRmaProxyPutGroupDoneNumOps(bool persistent);
 ncclResult_t ncclRmaProxyPutGroupDoneParams(struct ncclRmaProxyDesc* desc, CUstreamBatchMemOpParams* params);
 
-// Stream-batch memop param builder for a wait descriptor.
+// Stream-batch memop param builders for a wait descriptor.
+int ncclRmaProxyWaitStartNumOps(const struct ncclRmaProxyDesc* desc);
+ncclResult_t ncclRmaProxyWaitStartParams(struct ncclRmaProxyDesc* desc, CUstreamBatchMemOpParams* params);
+int ncclRmaProxyWaitDoneNumOps(const struct ncclRmaProxyDesc* desc);
+ncclResult_t ncclRmaProxyWaitDoneParams(struct ncclRmaProxyCtx* rmaProxyCtx, struct ncclRmaProxyDesc* desc,
+                                        CUstreamBatchMemOpParams* params);
 int ncclRmaProxyWaitNumStreamOps(const struct ncclRmaProxyDesc* desc);
 ncclResult_t ncclRmaProxyWaitParams(struct ncclRmaProxyCtx* rmaProxyCtx, struct ncclRmaProxyDesc* desc,
                                     CUstreamBatchMemOpParams* params);

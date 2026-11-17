@@ -27,6 +27,7 @@ project(NCCL VERSION ${NCCL_MAJOR}.${NCCL_MINOR}.${NCCL_PATCH}
 include(GNUInstallDirs)
 
 # Make CMAKE_BUILD_TYPE to release by default if not set
+set(_NCCL_USER_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -51,9 +52,27 @@ option(RDMA_CORE "Enable RDMA core" OFF)
 option(NET_PROFILER "Enable network profiler" OFF)
 option(MLX5DV "Enable MLX5DV" OFF)
 option(MAX_EXT_NET_PLUGINS "Maximum external network plugins" 0)
-option(EMIT_LLVM_IR "Generate LLVM IR for device APIs" OFF)
+option(NCCL_EMIT_LLVM_IR "Generate LLVM IR for device APIs" OFF)
+option(SYM_GENK "Compile GENK kernels" OFF)
+option(NCCL_EXACT_KERNEL_NAMES "Use one CUDA kernel wrapper per NCCL device function" OFF)
+option(NCCL_EMIT_LTO_IR "Generate LTO IR for device APIs" OFF)
 option(BUILD_NCCL4PY "Enable nccl4py Python bindings targets" OFF)
-option(BUILD_NCCL_EP "Build NCCL EP contrib library" OFF)
+
+# CMAKE_BUILD_TYPE=Debug is equivalent to -DDEBUG=ON, and vice versa (case-insensitive).
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _NCCL_BUILD_TYPE_UC)
+if(_NCCL_USER_BUILD_TYPE AND DEBUG AND NOT _NCCL_BUILD_TYPE_UC STREQUAL "DEBUG")
+    message(WARNING "NCCL: DEBUG=ON and CMAKE_BUILD_TYPE=${_NCCL_USER_BUILD_TYPE} are inconsistent; building Debug.")
+endif()
+if(_NCCL_BUILD_TYPE_UC STREQUAL "DEBUG")
+    set(DEBUG ON)
+endif()
+if(DEBUG)
+    set(CMAKE_BUILD_TYPE "Debug")
+endif()
+
+if(SYM_GENK)
+    add_compile_definitions(SYM_GENK=1)
+endif()
 
 # Detect OS (use add_compile_definitions so CUDA .cu files get the define when built by NVCC)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -79,9 +98,32 @@ else()
     message(FATAL_ERROR "Unsupported compiler: ${CMAKE_CXX_COMPILER_ID}")
 endif()
 
+# Flag overrides applied when DEBUG=ON. Total replacement, not additive.
+if(NCCL_COMPILER_GCC)
+    set(DEBUG_HOST_FLAGS "-O0 -g -ggdb3" CACHE STRING "Host CXX flags applied when DEBUG=ON (overrides default)")
+elseif(NCCL_COMPILER_MSVC)
+    set(DEBUG_HOST_FLAGS "/Od /Zi /FS" CACHE STRING "Host CXX flags applied when DEBUG=ON (overrides default)")
+endif()
+set(DEBUG_DEVICE_FLAGS "-O0 -g -lineinfo" CACHE STRING "Device (NVCC) flags applied when DEBUG=ON (overrides default)")
+set(TLS_BACKEND "$ENV{TLS_BACKEND}" CACHE STRING "TLS backend (empty or OPENSSL3)")
+set_property(CACHE TLS_BACKEND PROPERTY STRINGS "" OPENSSL3)
+
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# Match Make's CUDA runtime selection, including compiler-generated link steps.
+set(CUDARTLIB "cudart_static" CACHE STRING "CUDA runtime library (cudart_static or cudart)")
+set_property(CACHE CUDARTLIB PROPERTY STRINGS cudart_static cudart)
+if(CUDARTLIB STREQUAL "cudart_static")
+    set(NCCL_CUDART_TARGET CUDA::cudart_static)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+elseif(CUDARTLIB STREQUAL "cudart")
+    set(NCCL_CUDART_TARGET CUDA::cudart)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+else()
+    message(FATAL_ERROR "Unsupported CUDARTLIB '${CUDARTLIB}'; expected cudart_static or cudart")
+endif()
 
 # CUDA version detection
 string(REGEX MATCH "([0-9]+\\.[0-9]+)" CUDA_VERSION "${CUDAToolkit_VERSION}")
@@ -134,10 +176,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
             set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;120")
         endif()
     elseif(${CUDA_MAJOR} EQUAL 13)
-        set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;110;120")
+        if(${CUDA_MINOR} LESS 4)
+            set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;110;120")
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;107;110;120")
+        endif()
     else()
         # For future CUDA versions, include all architectures up to the latest known
-        set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;110;120")
+        set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;107;110;120")
     endif()
 endif()
 message(STATUS "Using CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
@@ -145,8 +191,14 @@ message(STATUS "Using CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
 # Compiler-specific flags
 if(NCCL_COMPILER_GCC)
     # GCC/Clang-specific flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fvisibility=hidden -Wall -Wno-unused-function -Wno-sign-compare -Wvla -g")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fvisibility=hidden -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Wvla -g")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda -Xptxas -maxrregcount=96 -Xfatbin -compress-all -fPIC")
+    # --compress-mode=size shrinks the fatbin by about 40% without changing the generated code.
+    # It needs a driver that can load zstd-compressed images, which CUDA 13 already requires;
+    # CUDA 12 builds keep the default mode to stay compatible with older drivers.
+    if(CUDA_MAJOR GREATER_EQUAL 13)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --compress-mode=size")
+    endif()
 elseif(NCCL_COMPILER_MSVC)
     # MSVC-specific flags
     # /Zc:preprocessor enables conformant preprocessor for proper variadic macro handling (needed for NVTX)
@@ -156,6 +208,9 @@ elseif(NCCL_COMPILER_MSVC)
     # /wd4805 disables "unsafe mix of type 'bool' and type 'int'" - intentional bool/int mixing for flags
     # /wd4018 disables "signed/unsigned mismatch" - safe comparisons where signed value is always positive
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /wd4267 /wd4244 /wd4996 /wd4146 /wd4197 /wd5105 /wd4805 /wd4018 /FS /Zc:preprocessor")
+    # CUDA's static runtime links LIBCMT in all configurations, so use /MT consistently
+    # for C++, CUDA, and test targets to avoid mixing incompatible CRT libraries.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
     # --compress-mode=balance is not supported by ptxas in CUDA 13.1 on Windows; omit for compatibility.
     # -Xcompiler /Zc:preprocessor passes the conformant preprocessor flag to cl.exe when invoked by nvcc
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --compress-mode=balance --ptxas-options=-maxrregcount=96 -Xcompiler /Zc:preprocessor")
@@ -196,6 +251,7 @@ if(WERROR)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX")
     else()
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Werror=all-warnings -Xcompiler -Werror")
     endif()
 endif()
 
@@ -204,6 +260,15 @@ if(PROFAPI)
 endif()
 
 set(EXTRA_LIBS)
+
+set(NCCL_TLS_INCLUDE_DIRS)
+if(TLS_BACKEND STREQUAL "OPENSSL3")
+    find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL Crypto)
+    add_compile_definitions(NCCL_TLS_BACKEND_OPENSSL3=1)
+    list(APPEND NCCL_TLS_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
+elseif(NOT TLS_BACKEND STREQUAL "")
+    message(FATAL_ERROR "Unsupported TLS_BACKEND '${TLS_BACKEND}'; expected OPENSSL3 or empty")
+endif()
 
 # RDMA and MLX5DV are Linux-specific features
 if(RDMA_CORE)
@@ -235,7 +300,7 @@ if(NCCL_OS_WINDOWS)
     # Windows: explicitly disable GIN so all code (host + device) and headers see it as 0
     add_definitions(-DNCCL_GIN_PROXY_ENABLE=0)
 else()
-    add_definitions(-DDOCA_VERBS_USE_CUDA_WRAPPER)
+    add_definitions(-DDOCA_GPUNETIO_USE_CUDA_WRAPPER)
     add_definitions(-DDOCA_VERBS_USE_NET_WRAPPER)
     add_definitions(-DNCCL_GIN_PROXY_ENABLE=1)
 endif()
@@ -246,22 +311,21 @@ if(RT_LIBRARY)
     list(APPEND EXTRA_LIBS rt)
 endif()
 
-# Debug/Release specific flags
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} ${DEBUG_HOST_FLAGS}")
 if(NCCL_COMPILER_GCC)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -O0")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3")
 elseif(NCCL_COMPILER_MSVC)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} /Od /Zi /FS")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} /O2 /FS")   # Maximum available optimization for MSVC
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} /O2 /FS")
 endif()
-
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS} -O0 -G -g")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS} ${DEBUG_DEVICE_FLAGS}")
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS} -O3")
 
 if(NCCL_OS_LINUX)
+  add_subdirectory(plugins/gin/example)
   add_subdirectory(plugins/mixed/example)
   add_subdirectory(plugins/net)
   add_subdirectory(plugins/profiler/example)
+  add_subdirectory(plugins/rma/example)
   add_subdirectory(plugins/tuner/example)
   add_subdirectory(plugins/env/example)
 endif()
@@ -285,19 +349,24 @@ if(BUILD_SRCTXZ_PACKAGE OR BUILD_PACKAGES)
   add_subdirectory(pkg/srctxz)
 endif()
 
-if(EMIT_LLVM_IR)
+if(NCCL_EMIT_LLVM_IR OR NCCL_EMIT_LTO_IR)
     add_subdirectory(bindings/ir)
+endif()
+
+if(NCCL_EMIT_LLVM_IR)
     add_dependencies(llvm_ir nccl_header)
     add_custom_target(nccl_with_ir ALL DEPENDS nccl llvm_ir)
     message(STATUS "LLVM IR generation will be included in default build")
 endif()
 
-if(BUILD_NCCL4PY)
-  add_subdirectory(bindings/nccl4py)
+if(NCCL_EMIT_LTO_IR)
+    add_dependencies(ltoir nccl_header)
+    add_custom_target(nccl_with_ltoir ALL DEPENDS nccl ltoir)
+    message(STATUS "LTO IR generation will be included in default build")
 endif()
 
-if(BUILD_NCCL_EP)
-  add_subdirectory(contrib/nccl_ep)
+if(BUILD_NCCL4PY)
+  add_subdirectory(bindings/nccl4py)
 endif()
 
 ###################### CMake package config for find_package(NCCL) ######################

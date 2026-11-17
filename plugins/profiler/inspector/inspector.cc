@@ -8,6 +8,7 @@
 #include "inspector.h"
 #include "profiler.h"
 #include "inspector_prom.h"
+#include "inspector_otel.h"
 #include "inspector_json.h"
 #include "inspector_cudawrap.h"
 #include "inspector_ring.h"
@@ -47,6 +48,11 @@ static bool enableNcclInspectorDumpThread = false;
 static bool enableNcclInspectorDumpVerbose = false;
 // Global flag to control prometheus format dumping
 static bool enableNcclInspectorPromDump = false;
+static bool warnedOtelPromDumpConflict = false;
+// Opt-in flag for the extra per-device stats metrics (collectives/p2p totals
+// and drop counters) in Prometheus mode; kept off so the default Prometheus
+// output stays minimal. Non-static: read from inspector_prom.cc.
+bool enableNcclInspectorPromStats = false;
 // Per-communicator completed-collective ring buffer capacity
 static uint32_t ncclInspectorDumpCollRingSize = 1024;
 // Per-communicator completed-P2P ring buffer capacity
@@ -62,6 +68,7 @@ static bool ncclInspectorInit = false;
 bool enableNcclInspectorP2p = true;
 // Global flag: require kernel-based timing; discard events without it
 bool requireKernelTiming = true;
+bool useNcclSourcedTimings = false;
 bool inspectorIsDumpVerboseEnabled() {
   return enableNcclInspectorDumpVerbose;
 }
@@ -637,7 +644,15 @@ inspectorResult_t inspectorDumpThread::inspectorStateDump(const char* output_roo
     return inspectorDisabledError;
   }
 
-  if (enableNcclInspectorPromDump) {
+  if (inspectorOtelIsEnabled()) {
+    if (enableNcclInspectorPromDump && !warnedOtelPromDumpConflict) {
+      WARN_INSPECTOR(
+        "NCCL Inspector: NCCL_INSPECTOR_OTEL_EXPORT=1 takes precedence over "
+        "NCCL_INSPECTOR_PROM_DUMP=1; Prometheus textfile output is skipped");
+      warnedOtelPromDumpConflict = true;
+    }
+    return inspectorStateDumpOtel(output_root);
+  } else if (enableNcclInspectorPromDump) {
     return inspectorStateDumpProm(output_root);
   } else {
     return inspectorStateDumpJSON(output_root);
@@ -672,10 +687,9 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output
 inspectorResult_t inspectorDumpThread::inspectorStateDumpProm(const char* output_root) {
   // Write communicators directly to files with per-device flushing
   // handled inside
-  inspectorResult_t dumpResult
-    = inspectorPromCommInfoListDump(&g_state.liveComms,
-                                    output_root,
-                                    this);
+  inspectorResult_t dumpResult = inspectorPromCommInfoListDump(&g_state.liveComms,
+                                                               output_root,
+                                                               this);
   if (dumpResult != inspectorSuccess) {
     INFO_INSPECTOR("NCCL Inspector: Direct Prometheus dump failed: %s",
                    inspectorErrorString(dumpResult));
@@ -683,6 +697,23 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpProm(const char* output
   }
 
   // Finalize deleted communicators
+  if (g_state.deletedComms.ncomms > 0) {
+    inspectorCommInfoListFinalize(&g_state.deletedComms);
+  }
+
+  return inspectorSuccess;
+}
+
+inspectorResult_t inspectorDumpThread::inspectorStateDumpOtel(const char* output_root) {
+  (void)output_root;
+
+  inspectorResult_t dumpResult = inspectorOtelCommInfoListDump(&g_state.liveComms);
+  if (dumpResult != inspectorSuccess) {
+    INFO_INSPECTOR("NCCL Inspector: OTLP dump failed: %s",
+                   inspectorErrorString(dumpResult));
+    return dumpResult;
+  }
+
   if (g_state.deletedComms.ncomms > 0) {
     inspectorCommInfoListFinalize(&g_state.deletedComms);
   }
@@ -752,18 +783,20 @@ static inspectorResult_t inspectorStartDumpThread(int64_t intervalUsecs) {
     }
 
     dumper = new inspectorDumpThread(dumpdir, intervalUsecs);
+    const char* format = inspectorOtelIsEnabled()
+        ? "OTLP"
+        : (enableNcclInspectorPromDump ? "Prometheus" : "JSON");
     if (intervalUsecs == 0) {
       INFO_INSPECTOR(
         "NCCL Inspector enabled with continuous dumping, "
         "output directory %s, format %s",
         dumpdir,
-        enableNcclInspectorPromDump ? "Prometheus" : "JSON");
+        format);
     } else {
       INFO_INSPECTOR(
         "NCCL Inspector enabled with polling interval %ld us, "
         "output directory %s, format %s",
-        intervalUsecs, dumpdir,
-        enableNcclInspectorPromDump ? "Prometheus" : "JSON");
+        intervalUsecs, dumpdir, format);
     }
     dumper->startThread();
 
@@ -826,11 +859,21 @@ static void showInspectorEnvVars() {
   } envVars[] = {
     {"NCCL_INSPECTOR_ENABLE", getenv("NCCL_INSPECTOR_ENABLE"), "0", "Enable/disable inspector plugin"},
     {"NCCL_INSPECTOR_ENABLE_P2P", getenv("NCCL_INSPECTOR_ENABLE_P2P"), "1", "Enable/disable P2P tracking"},
+    {"NCCL_INSPECTOR_NCCL_SOURCED_TIMINGS", getenv("NCCL_INSPECTOR_NCCL_SOURCED_TIMINGS"), "1", "Use NCCL-stamped event timestamps (v8 profiler interface) instead of plugin host clocks; set 0 to fall back to plugin host clocks"},
     {"NCCL_INSPECTOR_DUMP_THREAD_ENABLE", getenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE"), "1", "Enable/disable dump thread"},
     {"NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS", getenv("NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS"), "-1", "Dump interval in microseconds (-1 = disabled/dump only at teardown, 0 = continuous, >0 = periodic)"},
     {"NCCL_INSPECTOR_DUMP_DIR", getenv("NCCL_INSPECTOR_DUMP_DIR"), "(auto-generated)", "Output directory for inspector logs"},
     {"NCCL_INSPECTOR_DUMP_VERBOSE", getenv("NCCL_INSPECTOR_DUMP_VERBOSE"), "0", "Enable/disable verbose dumping (event_trace)"},
     {"NCCL_INSPECTOR_PROM_DUMP", getenv("NCCL_INSPECTOR_PROM_DUMP"), "0", "Enable/disable Prometheus format output dump"},
+    {"NCCL_INSPECTOR_PROM_DUMP_STATS", getenv("NCCL_INSPECTOR_PROM_DUMP_STATS"), "0", "Enable/disable extra per-device Prometheus stats metrics (collectives/p2p totals and drop counters)"},
+    {"NCCL_INSPECTOR_OTEL_EXPORT", getenv("NCCL_INSPECTOR_OTEL_EXPORT"), "0", "Enable/disable OTLP HTTP metrics export"},
+    {"NCCL_INSPECTOR_OTEL_VERBOSE", getenv("NCCL_INSPECTOR_OTEL_VERBOSE"), "0", "Enable/disable high-cardinality per-operation OTLP metrics"},
+    {"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"), "http://localhost:4318/v1/metrics", "OTLP HTTP metrics endpoint"},
+    {"OTEL_EXPORTER_OTLP_ENDPOINT", getenv("OTEL_EXPORTER_OTLP_ENDPOINT"), "(unset)", "OTLP HTTP endpoint fallback"},
+    {"OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", getenv("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"), "2000", "OTLP HTTP metrics export timeout in milliseconds"},
+    {"OTEL_EXPORTER_OTLP_TIMEOUT", getenv("OTEL_EXPORTER_OTLP_TIMEOUT"), "(unset)", "OTLP HTTP export timeout fallback in milliseconds"},
+    {"OTEL_SERVICE_NAME", getenv("OTEL_SERVICE_NAME"), "nccl-inspector", "OTLP service.name resource attribute"},
+    {"OTEL_RESOURCE_ATTRIBUTES", getenv("OTEL_RESOURCE_ATTRIBUTES"), "(unset)", "OTLP resource attributes"},
     {"NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES", getenv("NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES"), "8192", "Minimum message size (bytes) to be tracked by inspector"},
     {"NCCL_INSPECTOR_DUMP_COLL_RING_SIZE", getenv("NCCL_INSPECTOR_DUMP_COLL_RING_SIZE"), "1024", "Per-communicator completed-collective ring buffer capacity"},
     {"NCCL_INSPECTOR_DUMP_P2P_RING_SIZE", getenv("NCCL_INSPECTOR_DUMP_P2P_RING_SIZE"), "1024", "Per-communicator completed-P2P ring buffer capacity"},
@@ -947,6 +990,23 @@ static void initKernelTimingFromEnv() {
 /*
  * Description:
  *
+ *   Initializes the NCCL-sourced timings opt-in from the environment.
+ *   When enabled, the plugin asks NCCL (through the v8 profiler config)
+ *   to stamp event timestamps, and uses them in place of its own host
+ *   clock reads. Off by default because it makes NCCL run a periodic
+ *   GPU clock calibration on the profiler thread.
+ *
+ * Return:
+ *   None.
+ */
+static void initNcclSourcedTimingsFromEnv() {
+  const char* str = getenv("NCCL_INSPECTOR_NCCL_SOURCED_TIMINGS");
+  useNcclSourcedTimings = str ? (atoi(str) != 0) : true;
+}
+
+/*
+ * Description:
+ *
  *   Initializes event pools using sizes from environment variables.
  *
  * Return:
@@ -987,6 +1047,13 @@ static inspectorResult_t initDumpThreadFromEnv() {
   str = getenv("NCCL_INSPECTOR_PROM_DUMP");
   enable = str ? atoi(str) : 0;
   enableNcclInspectorPromDump = enable == 0 ? false : true;
+  warnedOtelPromDumpConflict = false;
+
+  str = getenv("NCCL_INSPECTOR_PROM_DUMP_STATS");
+  enable = str ? atoi(str) : 0;
+  enableNcclInspectorPromStats = enable == 0 ? false : true;
+
+  inspectorOtelInitFromEnv();
 
   str = getenv("NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS");
   if (str) {
@@ -995,7 +1062,8 @@ static inspectorResult_t initDumpThreadFromEnv() {
     ncclInspectorDumpIntervalUsecs = -1;
   }
 
-  if (enableNcclInspectorPromDump && enableNcclInspectorDumpThread && ncclInspectorDumpIntervalUsecs >= 0) {
+  if (enableNcclInspectorPromDump && !inspectorOtelIsEnabled()
+      && enableNcclInspectorDumpThread && ncclInspectorDumpIntervalUsecs >= 0) {
     ncclInspectorDumpIntervalUsecs
       = inspectorPromValidateInterval(ncclInspectorDumpIntervalUsecs);
   }
@@ -1068,6 +1136,7 @@ inspectorResult_t inspectorGlobalInit(int rank) {
   INS_CHK(inspectorGlobalStateInit());
   initP2pTrackingFromEnv();
   initKernelTimingFromEnv();
+  initNcclSourcedTimingsFromEnv();
   INS_CHK(inspectorEventPoolInitFromEnv());
   INS_CHK(initDumpThreadFromEnv());
   return inspectorSuccess;
@@ -1605,11 +1674,14 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->isP2p = false;
   completedOp->func = ncclStringToFunc(collInfo->func);
   completedOp->sn = collInfo->sn;
+  completedOp->timestampUsec = collInfo->tsCompletedUsec
+      ? collInfo->tsCompletedUsec : inspectorGetTime();
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecs(collInfo, &completedOp->timingSource);
   completedOp->algo = collInfo->algo;
   completedOp->proto = collInfo->proto;
+  completedOp->userTag = collInfo->userTag;
   completedOp->evtTrk = collInfo->collEvtTrk;
 }
 
@@ -1686,8 +1758,11 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->isP2p = true;
   completedOp->func = ncclStringToFunc(p2pInfo->func);
   completedOp->sn = p2pInfo->sn;
+  completedOp->timestampUsec = p2pInfo->tsCompletedUsec
+      ? p2pInfo->tsCompletedUsec : inspectorGetTime();
   completedOp->msgSizeBytes = p2pInfo->msgSizeBytes;
   completedOp->peer = p2pInfo->peer;
+  completedOp->userTag = p2pInfo->userTag;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;

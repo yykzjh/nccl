@@ -12,9 +12,11 @@
 #include "timer.h"
 #include "transport.h"
 
-struct ncclTransport* ncclTransports[NTRANSPORTS + 1] = {
-  &p2pTransport, &shmTransport, &netTransport, &collNetTransport,
-  &profilerTransport // Not really used for transport, only to create proxy ops polling on profiler counters.
+struct ncclTransport* ncclTransports[NTRANSPORTS] = {
+  &p2pTransport,
+  &shmTransport,
+  &netTransport,
+  &collNetTransport,
 };
 
 template <int type>
@@ -353,8 +355,8 @@ exit:
     if (data[i]) free(data[i]);
   }
   free(data);
-  if (sendData) free(sendData);
-  if (recvData) free(recvData);
+  free(sendData);
+  free(recvData);
 
   NCCLCHECK(ncclStreamWaitStream(deviceStream, hostStream, comm->sharedRes->scratchEvent));
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream,
@@ -443,8 +445,8 @@ bool ncclTransportCollNetSetup(struct ncclComm* comm, struct ncclTopoGraph* coll
           comm->node, nMasters, masterPeer);
   }
 cleanup:
-  if (allConnects != NULL) free(allConnects);
-  if (masterConnects != NULL) free(masterConnects);
+  free(allConnects);
+  free(masterConnects);
   return ret != ncclSuccess;
 }
 

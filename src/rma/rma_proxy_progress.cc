@@ -9,6 +9,7 @@
 #include "checks.h"
 #include "compiler.h"
 #include "comm.h"
+#include "rma/rma.h"
 #include "rma/rma_proxy.h"
 
 // Helper functions to manage request credits
@@ -19,13 +20,17 @@ static inline bool ncclRmaProxyCanIssueRequest(struct ncclRmaProxyCtx* ctx, int 
 // Issue one putSignal op via the network.
 static ncclResult_t ncclRmaProxyIssuePutSignal(ncclRma_t* ncclRma, struct ncclRmaProxyCtx* ctx,
                                                struct ncclRmaPutSignalOp* ps) {
+  // Since we previously connected to handles[] of length railsize, iput's rank argument is a slot in that array, not a world rank.
+  // ps->targetRank is passed as a world rank, so you convert at the ncclRma->op call.
+  int targetPeer;
+  NCCLCHECK(ncclRmaProxyWorldToPeer(ctx, ps->targetRank, &targetPeer));
   if (ps->signal.op == 0) {
-    NCCLCHECK(ncclRma->iput(ctx->rmaCtx, 0, ps->srcOff, ps->srcHandle, ps->size, ps->dstOff, ps->dstHandle,
-                            ps->targetRank, &ps->request));
+    NCCLCHECK(ncclRma->iput(ctx->rmaCtx, 0, ps->srcOff, ps->srcHandle, ps->size, ps->dstOff, ps->dstHandle, targetPeer,
+                            /*optFlags*/ 0, &ps->request));
   } else {
     NCCLCHECK(ncclRma->iputSignal(ctx->rmaCtx, 0, ps->srcOff, ps->srcHandle, ps->size, ps->dstOff, ps->dstHandle,
-                                  ps->targetRank, ps->signal.offset, ps->signal.signalMhandle, ps->signal.val,
-                                  ps->signal.op, /*isStrongSignal*/ true, &ps->request));
+                                  targetPeer, ps->signal.offset, ps->signal.signalMhandle, ps->signal.val,
+                                  ps->signal.op, /*isStrongSignal*/ true, /*optFlags*/ 0, &ps->request));
   }
   // Defensive: RMA proxy iput/iputSignal should return a non-NULL request with inflightReqeusts checked.
   if (ps->request == nullptr) {
@@ -76,7 +81,7 @@ static ncclResult_t ncclRmaProxyProgressPutSignalGroup(ncclRma_t* ncclRma, struc
 static ncclResult_t ncclRmaProxyPollNonPersistCompletion(ncclRma_t* ncclRma, struct ncclRmaProxyCtx* ctx, int peer) {
   while (true) {
     struct ncclRmaProxyDesc* head = ncclIntruQueueHead(&ctx->inProgressQueues[peer]);
-    if (head == nullptr) break;  // No InProgress Descs
+    if (head == nullptr) break; // No InProgress Descs
 
     bool fullyDone = false;
     if (head->rmaDescType == ncclRmaDescTypePutSignal) {
@@ -88,7 +93,7 @@ static ncclResult_t ncclRmaProxyPollNonPersistCompletion(ncclRma_t* ncclRma, str
       fullyDone = (head->putSignalGroup.nCompleted == head->putSignalGroup.nOps);
     }
 
-    if (!fullyDone) break;  // FIFO at this slot - don't peek behind head
+    if (!fullyDone) break; // FIFO at this slot - don't peek behind head
 
     INFO(NCCL_COLL,
          "Rank %d ncclRmaProxyPollNonPersistCompletion: peer=%d type=%d descSeq=%lu COMPLETED, updating doneSeq",
@@ -153,9 +158,11 @@ static ncclResult_t ncclRmaProxyPollNonPersistDesc(ncclRma_t* ncclRma, struct nc
 // written through the NIC-GPU path is visible in vidmem.
 static ncclResult_t ncclRmaProxyFlushNicGpuPath(ncclRma_t* ncclRma, struct ncclRmaProxyCtx* ctx) {
   void* request = nullptr;
+  int targetPeer;
+  NCCLCHECK(ncclRmaProxyWorldToPeer(ctx, ctx->comm->rank, &targetPeer));
   size_t flushOff = (size_t)ctx->comm->rank * sizeof(uint64_t);
   NCCLCHECK(ncclRma->iput(ctx->rmaCtx, 0, flushOff, ctx->flushBufMhandle, sizeof(uint64_t), flushOff,
-                          ctx->flushBufMhandle, ctx->comm->rank, &request));
+                          ctx->flushBufMhandle, targetPeer, /*optFlags*/ 0, &request));
   int done = 0;
   while (!done) {
     NCCLCHECK(ncclRma->test(ctx->rmaCollComm, request, &done));
@@ -235,8 +242,9 @@ static ncclResult_t ncclRmaProxyPollPersistDesc(ncclRma_t* ncclRma, struct ncclR
         bool signalsAllArrived = true;
         for (int i = 0; i < desc->waitSignal.npeers; i++) {
           int peerRank = desc->waitSignal.waitPeers[i];
-          uint64_t signalVal = COMPILER_ATOMIC_LOAD(&ctx->cpuAccessSignals[peerRank], std::memory_order_acquire);
-          if (signalVal < ctx->cpuAccessSignalsHost[peerRank] + desc->waitSignal.waitSignals[i]) {
+          size_t signalSlot = ncclRmaSignalSlot(ctx->comm->nRanks, desc->waitSignal.waitSignalIdxs[i], peerRank);
+          uint64_t signalVal = COMPILER_ATOMIC_LOAD(&ctx->cpuAccessSignals[signalSlot], std::memory_order_acquire);
+          if (signalVal < ctx->cpuAccessSignalsHost[signalSlot] + desc->waitSignal.waitSignals[i]) {
             signalsAllArrived = false;
             break;
           }
@@ -249,7 +257,8 @@ static ncclResult_t ncclRmaProxyPollPersistDesc(ncclRma_t* ncclRma, struct ncclR
 
           for (int i = 0; i < desc->waitSignal.npeers; i++) {
             int peerRank = desc->waitSignal.waitPeers[i];
-            ctx->cpuAccessSignalsHost[peerRank] += desc->waitSignal.waitSignals[i];
+            size_t signalSlot = ncclRmaSignalSlot(ctx->comm->nRanks, desc->waitSignal.waitSignalIdxs[i], peerRank);
+            ctx->cpuAccessSignalsHost[signalSlot] += desc->waitSignal.waitSignals[i];
           }
 
           COMPILER_ATOMIC_STORE(desc->doneSeq, (uint64_t)1, std::memory_order_release);
@@ -271,16 +280,17 @@ ncclResult_t ncclRmaProxyProgress(ncclRma_t* ncclRma, void* rmaProxyCtx) {
 
   if (ncclRma->rmaProgress) NCCLCHECK(ncclRma->rmaProgress(ctx->rmaCtx));
 
-  // Loop through each peer's queues
-  for (int i = 0; i < ctx->comm->nRanks; i++) {
+  // Start at our own rank so different senders do not all visit peer 0 first.
+  for (int i = 0; i < ctx->comm->nRanks; i += ctx->ctxStride) {
+    int peer = (ctx->comm->rank + i) % ctx->comm->nRanks;
     // Step 1: Poll completion of InProgress Descs (non-graph)
-    NCCLCHECK(ncclRmaProxyPollNonPersistCompletion(ncclRma, ctx, i));
+    NCCLCHECK(ncclRmaProxyPollNonPersistCompletion(ncclRma, ctx, peer));
 
     // Step 2: Poll and issue ready Pending Descs (non-graph)
-    NCCLCHECK(ncclRmaProxyPollNonPersistDesc(ncclRma, ctx, i));
+    NCCLCHECK(ncclRmaProxyPollNonPersistDesc(ncclRma, ctx, peer));
 
     // Step 3: Poll persistent descriptors (graph mode)
-    NCCLCHECK(ncclRmaProxyPollPersistDesc(ncclRma, ctx, i));
+    NCCLCHECK(ncclRmaProxyPollPersistDesc(ncclRma, ctx, peer));
   }
   return ncclSuccess;
 }

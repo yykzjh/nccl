@@ -8,31 +8,9 @@
 #ifndef _NCCL_DEVICE_UTILITY_H_
 #define _NCCL_DEVICE_UTILITY_H_
 
-// compiler specific check for __CUDACC__
-#ifndef NCCL_CHECK_CUDACC
-#if defined(__clang__)
 #ifdef __CUDACC__
-#define NCCL_CHECK_CUDACC 1
-#else
-#define NCCL_CHECK_CUDACC 0
-#endif
-#else
-#if __CUDACC__
-#define NCCL_CHECK_CUDACC 1
-#else
-#define NCCL_CHECK_CUDACC 0
-#endif
-#endif
-#endif
-
-#if NCCL_CHECK_CUDACC
-#if defined(__clang_llvm_bitcode_lib__)
-#define NCCL_DEVICE_INLINE __device__ __attribute__((always_inline))
-#define NCCL_HOST_DEVICE_INLINE __host__ __device__ __attribute__((always_inline))
-#else
 #define NCCL_DEVICE_INLINE __device__ __forceinline__
 #define NCCL_HOST_DEVICE_INLINE __host__ __device__ __forceinline__
-#endif
 #else
 #ifndef __host__
 #define __host__
@@ -75,12 +53,6 @@
 #define NCCL_EXTERN_C
 #endif
 
-#ifdef __clang_llvm_bitcode_lib__
-#define NCCL_IR_EXTERN_C extern "C"
-#else
-#define NCCL_IR_EXTERN_C
-#endif
-
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -88,7 +60,7 @@
 #include <intrin.h>
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 #include <cuda/atomic>
 #endif
 
@@ -96,7 +68,7 @@
 namespace nccl {
 namespace utility {
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 // cuda/atomic header file is included so we can use atomic_ref to load the abortFlag
 static NCCL_DEVICE_INLINE bool testAbort(uint32_t* abortFlag, uint32_t& steps) {
   const uint32_t maxSteps = 10000;
@@ -137,7 +109,7 @@ struct ValueAsType {
 
 // Returns the value zero but the compiler cannot prove that it is zero so it
 // is useful to inhibit compiler optimizations.
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 template <typename = void>
 NCCL_DEVICE_INLINE int opaqueZero() {
   __device__ static int zero = 0;
@@ -306,7 +278,7 @@ NCCL_HOST_DEVICE_INLINE uint64_t imodFast64(uint64_t x, uint64_t y, uint64_t yrc
   return r;
 }
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 // Precomputed integer reciprocoals for denominator values 1..64 inclusive.
 // Pass these to idivFast64() for fast division on the GPU.
 NCCL_DEVICE_INLINE uint64_t idivRcp64_upto64(int x) {
@@ -335,13 +307,13 @@ NCCL_DEVICE_INLINE uint64_t idivRcp64_upto64(int x) {
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 NCCL_DEVICE_INLINE uint32_t idivRcp32_upto64(int x) {
   return idivRcp64_upto64(x) >> 32;
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 NCCL_DEVICE_INLINE cuda::memory_order acquireOrderOf(cuda::memory_order ord) {
   return ord == cuda::memory_order_release ? cuda::memory_order_relaxed :
          ord == cuda::memory_order_acq_rel ? cuda::memory_order_acquire :
@@ -354,7 +326,7 @@ NCCL_DEVICE_INLINE cuda::memory_order releaseOrderOf(cuda::memory_order ord) {
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 template <typename T>
 NCCL_DEVICE_INLINE T atomicLoad(T* ptr, cuda::memory_order ord, cuda::thread_scope scope) {
   switch (scope) {
@@ -372,7 +344,7 @@ NCCL_DEVICE_INLINE T atomicLoad(T* ptr, cuda::memory_order ord, cuda::thread_sco
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 template <typename T>
 NCCL_DEVICE_INLINE void atomicStore(T* ptr, T val, cuda::memory_order ord, cuda::thread_scope scope) {
   switch (scope) {
@@ -394,7 +366,7 @@ NCCL_DEVICE_INLINE void atomicStore(T* ptr, T val, cuda::memory_order ord, cuda:
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
+#ifdef __CUDACC__
 NCCL_DEVICE_INLINE int lane() {
   int ret;
   asm("mov.u32 %0, %%laneid;" : "=r"(ret));
@@ -407,10 +379,11 @@ NCCL_DEVICE_INLINE unsigned int lanemask_lt() {
 }
 #endif
 
-#if NCCL_CHECK_CUDACC
-// Load anything, but cache like its constant memory.
+#ifdef __CUDACC__
+#define NCCL_DEVICE_LOADCONST_USE_LDG 0
+
 template <typename T>
-NCCL_DEVICE_INLINE T loadConst(T const* p) {
+NCCL_DEVICE_INLINE T loadConstLdg(T const* p) {
   if (alignof(T) == 1) {
     union {
       uint8_t part[sizeof(T)];
@@ -449,7 +422,17 @@ NCCL_DEVICE_INLINE T loadConst(T const* p) {
     return ret;
   }
 }
+
+// Use ordinary dereference loads with CUDA versions affected by the __ldg/acquire-fence regression.
+template <typename T>
+NCCL_DEVICE_INLINE T loadConst(T const* p) {
+#if NCCL_DEVICE_LOADCONST_USE_LDG
+  return loadConstLdg(p);
+#else
+  return *p;
 #endif
+}
+#endif // __CUDACC__
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optional<T>: Holds a T that may or may not be constructed. An Optional

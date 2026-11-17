@@ -8,6 +8,7 @@
 #ifndef EVENT_H_
 #define EVENT_H_
 
+#include <pthread.h>
 #include <sys/types.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -23,16 +24,23 @@ typedef enum {
   CE_TIMING_GPU = 1
 } CeTimingMode_t;
 
-#define MAX_CHANNELS                     32
+// Must match MAXCHANNELS in NCCL's src/include/device.h (not exposed by the public or
+// plugin API). Core reports raw channel ids in [0, MAXCHANNELS) and does not clamp them.
+#define MAX_CHANNELS                     64
 #define MAX_STEPS                        32
 #define MAX_OPS                          16 // Up to 64K ranks for PAT
 #define MAX_EVENTS_PER_REQ               (8)
+#define MAX_KERNEL_PHASES                3  // initial_sync, compute, final_sync (v7)
 
+struct context;
 struct proxyOp;
 struct proxyStep;
 
 struct netPlugin {
   uint64_t type;
+  struct context* ctx;              // profiler context
+  void* parent;                     // optional ProxyStep parent event
+  uint64_t parentType;              // parent event type, or 0 when parent is NULL
   int pluginType;
   int pluginVer;
   uint8_t pluginEvent;
@@ -52,7 +60,29 @@ struct netPlugin {
   };
   double startTs;
   double stopTs;
-  struct proxyStep* parent;
+};
+
+// Chunks never move or reuse records; handles stay valid until context cleanup.
+#define NET_PLUGIN_EVENTS_PER_CHUNK 4096
+struct netPluginChunk {
+  struct netPlugin events[NET_PLUGIN_EVENTS_PER_CHUNK];
+  int numUsed;                         // atomic reservations; bounded by chunk capacity
+  struct netPluginChunk* next;
+};
+
+struct kernelCh;
+
+// v7 kernel barrier phase sub-event (child of a kernelCh)
+struct kernelPhase {
+  uint64_t type;                    // ncclProfileKernelPhase; must be first (handle dispatch reads *(uint64_t*))
+  uint8_t channelId;
+  uint8_t phaseId;                  // 0=initial_sync, 1=compute, 2=final_sync
+  const char* phaseName;
+  uint64_t startGpuClk;
+  uint64_t stopGpuClk;
+  double startTs;
+  double stopTs;
+  struct kernelCh* parent;
 };
 
 struct kernelCh {
@@ -63,6 +93,7 @@ struct kernelCh {
   double stopTs;
   uint64_t startGpuClk;
   uint64_t stopGpuClk;
+  struct kernelPhase phases[MAX_KERNEL_PHASES]; // v7: per-phase timing, indexed by phaseId
 };
 
 #define PROXY_STEP_SEND_GPU_WAIT 0
@@ -82,8 +113,6 @@ struct proxyStep {
   double startTs;
   double stopTs;
   struct proxyOp* parent;
-  struct netPlugin net[MAX_EVENTS_PER_REQ];
-  int nNetEvents;
 };
 
 struct proxyOp {
@@ -105,7 +134,6 @@ struct proxyOp {
 };
 
 struct group;
-struct context;
 
 struct proxyCtrl {
   uint64_t type;
@@ -140,6 +168,8 @@ struct collective {
   const char* algo;
   const char* proto;
   int nWarps;
+  const char* kernelVariant;        // v7: symmetric-kernel variant (NULL for non-sym)
+  bool isSymColl;                   // v7: symmetric collective flag
   struct proxyOp op[MAX_CHANNELS][2*MAX_OPS];
   int nProxyOps[MAX_CHANNELS];
   struct kernelCh kernel[MAX_CHANNELS];
@@ -209,6 +239,7 @@ struct p2pApi {
 struct kernelLaunch {
   uint64_t type;
   struct groupApi* parent;
+  struct context* ctx;              // profiler context
   cudaStream_t stream;
   int kernelLaunchId;
   double startTs;
@@ -376,6 +407,10 @@ struct context {
   int proxyCtrlPoolBase;
   int proxyCtrlPoolIndex;
   struct proxyCtrl* proxyCtrlPool;
+
+  pthread_mutex_t netPluginMutex;   // protects chunk creation and linking
+  struct netPluginChunk* netPluginHead;
+  struct netPluginChunk* netPluginTail; // published with release, loaded with acquire
 
   // CE event pools
   int ceCollPoolSize;

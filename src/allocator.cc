@@ -26,7 +26,6 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
   CUmemGenericAllocationHandle handle = (CUmemGenericAllocationHandle)-1;
   int cudaDev;
   int flag;
-  int dcnt;
 
   if (ptr == NULL || size == 0) goto fallback;
 
@@ -53,7 +52,6 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
     CUCHECK(cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, currentDev));
     if (flag) memprop.allocFlags.gpuDirectRDMACapable = 1;
     CUCHECK(cuMemGetAllocationGranularity(&memGran, &memprop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-    CUDACHECK(cudaGetDeviceCount(&dcnt));
     ALIGN_SIZE(handleSize, memGran);
 
 #if CUDART_VERSION >= 12030
@@ -79,17 +77,12 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
     CUCHECK(cuMemAddressReserve((CUdeviceptr*)ptr, handleSize, memGran, 0, 0));
     /* Map the virtual address range to the physical allocation */
     CUCHECK(cuMemMap((CUdeviceptr)*ptr, handleSize, 0, handle, 0));
-    /* Now allow RW access to the newly mapped memory */
-    for (int i = 0; i < dcnt; ++i) {
-      int p2p = 0;
-      if (i == cudaDev || (CUDASUCCESS(cudaDeviceCanAccessPeer(&p2p, i, cudaDev)) && p2p)) {
-        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc.location.id = i;
-        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, handleSize, &accessDesc, 1));
-      }
-      if (0 == p2p && i != cudaDev) INFO(NCCL_ALLOC, "P2P not supported between GPU%d and GPU%d", cudaDev, i);
-    }
+    /* Now allow RW access to the newly mapped memory -- owner device only.
+       Any ranks peer-mapping this memory will call cuMemSetAccess on their own. */
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = cudaDev;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, handleSize, &accessDesc, 1));
     goto exit;
   }
 
@@ -203,7 +196,7 @@ static void insertSegment(struct ncclSpace* a, int index, int64_t lo, int64_t hi
   a->count = w;
 }
 
-ncclResult_t ncclSpaceAlloc(struct ncclSpace* a, int64_t limit, int64_t size, int align, int64_t* outOffset) {
+ncclResult_t ncclSpaceTryAlloc(struct ncclSpace* a, int64_t limit, int64_t size, int align, int64_t* outOffset) {
   // When allocating we try to locate the first empty segment which can hold
   // the allocation and move its lower cut upward.
   int i = a->count % 2; // First empty segment ends at cuts[i]
@@ -225,9 +218,15 @@ ncclResult_t ncclSpaceAlloc(struct ncclSpace* a, int64_t limit, int64_t size, in
     }
     i += 2; // Next empty segment
   }
-  WARN("Allocation failed. No suitable space found to accommodate size=0x%lx within limit=0x%lx", (long)size,
-       (long)limit);
   return ncclInternalError;
+}
+
+ncclResult_t ncclSpaceAlloc(struct ncclSpace* a, int64_t limit, int64_t size, int align, int64_t* outOffset) {
+  ncclResult_t res = ncclSpaceTryAlloc(a, limit, size, align, outOffset);
+  if (res != ncclSuccess)
+    WARN("Allocation failed. No suitable space found to accommodate size=0x%lx within limit=0x%lx", (long)size,
+         (long)limit);
+  return res;
 }
 
 ncclResult_t ncclSpaceFree(struct ncclSpace* a, int64_t offset, int64_t size) {
@@ -280,6 +279,7 @@ void ncclShadowPoolConstruct(struct ncclShadowPool* pool) {
   pool->hbits = 0;
   pool->count = 0;
   pool->table = nullptr;
+  pool->memPool = nullptr;
   pool->pages = nullptr;
 }
 
@@ -298,7 +298,8 @@ ncclResult_t ncclShadowPoolDestruct(struct ncclShadowPool* pool, cudaStream_t st
               pool->pages = page;
             }
           } else {
-            cudaFreeAsync(obj->devObj, stream);
+            if (pool->memPool) cudaFreeAsync(obj->devObj, stream);
+            else cudaFree(obj->devObj);
           }
           struct ncclShadowObject* next = obj->next;
           free(obj);
@@ -309,14 +310,15 @@ ncclResult_t ncclShadowPoolDestruct(struct ncclShadowPool* pool, cudaStream_t st
     free(pool->table);
 
     while (pool->pages != nullptr) {
-      cudaFreeAsync(pool->pages->devObjs, stream);
+      if (pool->memPool) cudaFreeAsync(pool->pages->devObjs, stream);
+      else cudaFree(pool->pages->devObjs);
       struct ncclShadowPage* next = pool->pages->next;
       free(pool->pages);
       pool->pages = next;
     }
 
     cudaStreamSynchronize(stream);
-    cudaMemPoolDestroy(pool->memPool);
+    if (pool->memPool) cudaMemPoolDestroy(pool->memPool);
   }
   return ncclSuccess;
 }
@@ -337,13 +339,19 @@ ncclResult_t ncclShadowPoolAlloc(struct ncclShadowPool* pool, size_t size, void*
 
   int hbits = pool->hbits;
   if (hbits == 0) {
-    cudaMemPoolProps props = {};
-    props.allocType = cudaMemAllocationTypePinned;
-    props.handleTypes = cudaMemHandleTypeNone;
-    props.location.type = cudaMemLocationTypeDevice;
-    cudaGetDevice(&props.location.id);
-    props.maxSize = (size_t)ncclParamShadowMempoolMaxSize();
-    CUDACHECK(cudaMemPoolCreate(&pool->memPool, &props));
+    int cudaDev = 0;
+    int memoryPoolsSupported = 0;
+    CUDACHECK(cudaGetDevice(&cudaDev));
+    CUDACHECK(cudaDeviceGetAttribute(&memoryPoolsSupported, cudaDevAttrMemoryPoolsSupported, cudaDev));
+    if (memoryPoolsSupported) {
+      cudaMemPoolProps props = {};
+      props.allocType = cudaMemAllocationTypePinned;
+      props.handleTypes = cudaMemHandleTypeNone;
+      props.location.type = cudaMemLocationTypeDevice;
+      props.location.id = cudaDev;
+      props.maxSize = (size_t)ncclParamShadowMempoolMaxSize();
+      CUDACHECK(cudaMemPoolCreate(&pool->memPool, &props));
+    }
 
     pool->hbits = hbits = 4;
     pool->table = (struct ncclShadowObject**)malloc(sizeof(struct ncclShadowObject*) << hbits);
@@ -385,7 +393,8 @@ ncclResult_t ncclShadowPoolAlloc(struct ncclShadowPool* pool, size_t size, void*
         page->freeMask = uint64_t(-1) >> (64 - pageSize / pageObjSize);
         page->next = pool->pages;
         pool->pages = page;
-        CUDACHECK(cudaMallocFromPoolAsync(&page->devObjs, pageSize, pool->memPool, stream));
+        if (pool->memPool) CUDACHECK(cudaMallocFromPoolAsync(&page->devObjs, pageSize, pool->memPool, stream));
+        else CUDACHECK(cudaMalloc(&page->devObjs, pageSize));
         CUDACHECK(cudaMemsetAsync(page->devObjs, 0, pageSize, stream));
         // fall through...
       }
@@ -399,7 +408,8 @@ ncclResult_t ncclShadowPoolAlloc(struct ncclShadowPool* pool, size_t size, void*
     }
   } else {
     page = nullptr;
-    CUDACHECK(cudaMallocFromPoolAsync(&devObj, size, pool->memPool, stream));
+    if (pool->memPool) CUDACHECK(cudaMallocFromPoolAsync(&devObj, size, pool->memPool, stream));
+    else CUDACHECK(cudaMalloc(&devObj, size));
     CUDACHECK(cudaMemsetAsync(devObj, 0, size, stream));
   }
 
@@ -439,7 +449,8 @@ ncclResult_t ncclShadowPoolFree(struct ncclShadowPool* pool, void* devObj, cudaS
     int slot = ((char*)obj->devObj - (char*)obj->page->devObjs) / obj->page->objSize;
     obj->page->freeMask |= uint64_t(1) << slot;
   } else {
-    CUDACHECK(cudaFreeAsync(devObj, stream));
+    if (pool->memPool) CUDACHECK(cudaFreeAsync(devObj, stream));
+    else CUDACHECK(cudaFree(devObj));
   }
   free(obj);
   pool->count -= 1;
